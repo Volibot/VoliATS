@@ -1,0 +1,19 @@
+# Real secrets — never commit
+.env
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Runtime logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

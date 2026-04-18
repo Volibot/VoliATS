@@ -1,0 +1,45 @@
+name: HR Email Extractor
+
+on:
+  schedule:
+    # Runs every 5 minutes — GitHub's minimum interval
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    # Manual trigger from the Actions tab
+
+jobs:
+  extract-emails:
+    name: Extract & Insert Recruitment Emails
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      TARGET_MAILBOX:      ${{ secrets.TARGET_MAILBOX }}
+      DB_DSN:              ${{ secrets.DB_DSN }}
+      DB_TABLE_NAME:       ${{ secrets.DB_table }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run email extractor
+        run: python email_extractor.py
+
+      - name: Upload log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extractor-log-${{ github.run_id }}
+          path: extractor.log
+          retention-days: 7
