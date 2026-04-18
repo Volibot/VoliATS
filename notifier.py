@@ -1,0 +1,676 @@
+"""
+notifier.py — HR Bot Notification Emails (Volibits)
+
+Sends a rich HTML email to the recruiter who submitted the email after each
+processed email. The notification shows:
+
+  • Every field extracted for each candidate row
+  • Green  ✓  for fields that were successfully extracted
+  • Red    ✗  for fields that are missing / failed
+  • "Updated" section for rows where empty fields were filled in existing record
+  • "Conflict" section for rows pending recruiter decision
+  • A top-level summary banner (All Passed / Partial / All Failed)
+
+Also sends a separate HIGH-IMPORTANCE conflict notification email when the same
+candidate is found under a different recruiter, with mailto action links so the
+recipient can reply with UPDATE / NEW / SKIP without needing a web form.
+
+CC recipients (team lead + manager) are loaded from the NOTIFY_CC_EMAILS secret.
+Mail is sent via the mail-reading app (AZURE_* creds) which has Mail.Send.
+"""
+
+import os
+import re
+import requests
+import logging
+from datetime import datetime
+from typing import Optional
+
+log = logging.getLogger(__name__)
+
+TARGET_MAILBOX   = os.environ["TARGET_MAILBOX"]
+NOTIFY_CC_EMAILS = os.environ.get("NOTIFY_CC_EMAILS", "")
+
+
+# ─── Human-readable field labels ────────────────────────────────────────────────
+FIELD_LABELS: dict[str, str] = {
+    "name_of_candidate":   "Candidate Name",
+    "contact_number":      "Contact Number",
+    "email_id":            "Email ID",
+    "general_skill":       "General Skill",
+    "company_name":        "Company Code",
+    "recruiter":           "Recruiter",
+    "email_from":          "Email From",
+    "email_to":            "Email To",
+    "jr_no":               "JR No.",
+    "client_recruiter":    "Client Recruiter",
+    "date":                "Date",
+    "total_experience":    "Total Experience",
+    "relevant_experience": "Relevant Experience",
+    "current_ctc":         "Current CTC",
+    "expected_ctc":        "Expected CTC",
+    "notice_period":       "Notice Period",
+    "current_org":         "Current Organisation",
+    "current_location":    "Current Location",
+    "preferred_location":  "Preferred Location",
+    "delivery_type":       "Delivery Type",
+    "is_duplicate":        "Duplicate Flag",
+    "attachment":          "Attachment (OneDrive link)",
+    "remarks":             "Remarks",
+    "record_status":       "Record Status",
+}
+
+REQUIRED_FIELDS = {
+    "name_of_candidate", "contact_number", "email_id",
+    "general_skill", "company_name",
+    "recruiter", "email_from", "email_to",
+}
+
+FIELD_FAILURE_REASONS: dict[str, str] = {
+    "name_of_candidate": (
+        "Candidate name was not found in the table. "
+        "Ensure the column is labelled 'Candidate Name', 'Name', or similar."
+    ),
+    "contact_number": (
+        "Contact number is required for candidate identification and duplicate checks. "
+        "Add a 'Mobile', 'Phone', or 'Contact No.' column to the table."
+    ),
+    "email_id": (
+        "Email ID is required for candidate identification and duplicate checks. "
+        "Add an 'Email', 'Email ID', or 'Mail ID' column to the table."
+    ),
+    "general_skill": (
+        "Skill/role was not extracted from the email subject. "
+        "Ensure the subject follows the format:  CODE: Skill  (e.g. BS: Java Developer)."
+    ),
+    "company_name": (
+        "Company code was not found in the subject line. "
+        "Ensure the subject starts with a known code followed by a colon (e.g. BS:, RS:, HCL:)."
+    ),
+    "recruiter": (
+        "Recruiter name could not be derived from the sender email address. "
+        "The email must be sent from a valid Volibits address."
+    ),
+    "email_from": "Sender email address was missing from the message headers.",
+    "email_to": (
+        "Recipient email address was missing from the message headers. "
+        "The email must have at least one To: recipient."
+    ),
+}
+
+DISPLAY_ORDER = [
+    "name_of_candidate", "contact_number", "email_id",
+    "general_skill", "company_name", "jr_no", "client_recruiter",
+    "recruiter", "date", "current_org",
+    "total_experience", "relevant_experience",
+    "current_ctc", "expected_ctc", "notice_period",
+    "current_location", "preferred_location",
+    "delivery_type", "is_duplicate", "attachment", "remarks",
+    "record_status",
+]
+
+# Fields shown in conflict comparison table
+CONFLICT_COMPARE_FIELDS = [
+    "name_of_candidate", "contact_number", "email_id",
+    "jr_no", "general_skill", "company_name",
+    "total_experience", "relevant_experience",
+    "current_ctc", "expected_ctc", "notice_period",
+    "current_org", "current_location", "preferred_location",
+    "recruiter", "client_recruiter", "attachment", "remarks",
+]
+
+
+# ─── CSS ────────────────────────────────────────────────────────────────────────
+_CSS = """
+  body { font-family:'Segoe UI',Arial,sans-serif; font-size:14px;
+         color:#1a1a2e; background:#f4f6f9; margin:0; padding:0; }
+  .wrap  { max-width:800px; margin:24px auto; background:#fff;
+           border-radius:8px; overflow:hidden;
+           box-shadow:0 2px 12px rgba(0,0,0,.10); }
+  .hdr   { padding:24px 32px; }
+  .hdr.pass    { background:#1a7a4a; }
+  .hdr.fail    { background:#b71c1c; }
+  .hdr.partial { background:#e65100; }
+  .hdr.conflict{ background:#6a1b9a; }
+  .hdr h1 { margin:0; font-size:20px; color:#fff; }
+  .hdr p  { margin:4px 0 0; color:rgba(255,255,255,.85); font-size:13px; }
+  .body  { padding:24px 32px; }
+  .summary-bar { display:flex; gap:12px; margin-bottom:24px; flex-wrap:wrap; }
+  .stat  { flex:1; min-width:110px; padding:14px 18px; border-radius:6px;
+           text-align:center; }
+  .stat.ins    { background:#e8f5e9; border:1px solid #a5d6a7; }
+  .stat.skip   { background:#fff8e1; border:1px solid #ffe082; }
+  .stat.err    { background:#ffebee; border:1px solid #ef9a9a; }
+  .stat.upd    { background:#e3f2fd; border:1px solid #90caf9; }
+  .stat.conf   { background:#f3e5f5; border:1px solid #ce93d8; }
+  .stat .num { font-size:26px; font-weight:700; display:block; }
+  .stat .lbl { font-size:12px; color:#555; }
+  .stat.ins  .num { color:#2e7d32; }
+  .stat.skip .num { color:#f57f17; }
+  .stat.err  .num { color:#c62828; }
+  .stat.upd  .num { color:#1565c0; }
+  .stat.conf .num { color:#6a1b9a; }
+  .card  { border:1px solid #e0e0e0; border-radius:6px; margin-bottom:20px;
+           overflow:hidden; }
+  .card-hdr { display:flex; align-items:center; gap:10px;
+              padding:12px 18px; font-weight:600; font-size:15px; }
+  .card-hdr.pass    { background:#e8f5e9; color:#1b5e20; border-bottom:1px solid #c8e6c9; }
+  .card-hdr.fail    { background:#ffebee; color:#7f0000; border-bottom:1px solid #ffcdd2; }
+  .card-hdr.partial { background:#fff3e0; color:#bf360c; border-bottom:1px solid #ffe0b2; }
+  .card-hdr.skip    { background:#f3f4f6; color:#555;    border-bottom:1px solid #e0e0e0; }
+  .card-hdr.upd     { background:#e3f2fd; color:#0d47a1; border-bottom:1px solid #bbdefb; }
+  .card-hdr.nochange{ background:#f5f5f5; color:#757575; border-bottom:1px solid #e0e0e0; }
+  .card-hdr.conflict{ background:#f3e5f5; color:#4a148c; border-bottom:1px solid #e1bee7; }
+  .badge { padding:2px 10px; border-radius:12px; font-size:12px; font-weight:700;
+           margin-left:auto; }
+  .badge.pass     { background:#2e7d32; color:#fff; }
+  .badge.fail     { background:#c62828; color:#fff; }
+  .badge.partial  { background:#e65100; color:#fff; }
+  .badge.skip     { background:#78909c; color:#fff; }
+  .badge.upd      { background:#1565c0; color:#fff; }
+  .badge.nochange { background:#9e9e9e; color:#fff; }
+  .badge.conflict { background:#6a1b9a; color:#fff; }
+  .fields { padding:14px 18px; }
+  table.ft { width:100%; border-collapse:collapse; }
+  table.ft td { padding:6px 10px; vertical-align:top;
+                border-bottom:1px solid #f0f0f0; font-size:13px; }
+  table.ft td:first-child { width:38%; color:#555; font-weight:500; }
+  .val-ok   { color:#1b5e20; }
+  .val-miss { color:#c62828; font-style:italic; }
+  .val-upd  { color:#1565c0; font-weight:600; }
+  .reason   { font-size:12px; color:#7f0000; margin-top:3px;
+              padding:4px 8px; background:#fff8f8;
+              border-left:3px solid #ef9a9a; border-radius:0 4px 4px 0; }
+  .icon-ok   { color:#2e7d32; font-size:16px; }
+  .icon-fail { color:#c62828; font-size:16px; }
+  .icon-upd  { color:#1565c0; font-size:16px; }
+  /* Conflict comparison table */
+  table.cmp { width:100%; border-collapse:collapse; font-size:13px; }
+  table.cmp th { padding:8px 12px; background:#f3e5f5; color:#4a148c;
+                 text-align:left; font-weight:600; border-bottom:2px solid #ce93d8; }
+  table.cmp td { padding:7px 12px; border-bottom:1px solid #f0f0f0;
+                 vertical-align:top; }
+  table.cmp tr:nth-child(even) td { background:#fafafa; }
+  .cmp-empty { color:#bbb; font-style:italic; }
+  .cmp-diff  { background:#fff9c4 !important; }
+  /* Action buttons */
+  .actions { display:flex; gap:12px; margin:20px 0 8px; flex-wrap:wrap; }
+  .btn { display:inline-block; padding:11px 22px; border-radius:6px;
+         font-weight:700; font-size:14px; text-decoration:none;
+         text-align:center; min-width:140px; }
+  .btn-update { background:#1565c0; color:#fff; }
+  .btn-new    { background:#2e7d32; color:#fff; }
+  .btn-skip   { background:#78909c; color:#fff; }
+  .urgent-banner { background:#4a148c; color:#fff; padding:14px 20px;
+                   border-radius:6px; margin-bottom:20px; font-size:14px; }
+  .footer { padding:16px 32px; background:#f8f9fa; font-size:11px;
+            color:#9e9e9e; border-top:1px solid #e0e0e0; }
+"""
+
+
+def _val(v) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+# ─── Candidate card (standard processing report) ─────────────────────────────────
+def _candidate_card_html(row_summary: dict) -> str:
+    rd              = row_summary.get("record_data", {})
+    missing         = set(row_summary.get("missing", []))
+    outcome         = row_summary.get("outcome", "inserted")
+    updated_fields  = set(row_summary.get("updated_fields", []))
+    name            = _val(rd.get("name_of_candidate")) or row_summary.get("name", "(unknown)")
+    dup             = _val(row_summary.get("dup_flag"))
+    db_err          = row_summary.get("db_error")
+
+    # ── Card style per outcome ───────────────────────────────────────────────
+    if outcome == "skipped":
+        card_cls, badge_cls, badge_txt = "skip", "skip", "Skipped — Duplicate"
+    elif outcome == "no_change":
+        card_cls, badge_cls, badge_txt = "nochange", "nochange", "No Change"
+    elif outcome == "updated":
+        card_cls, badge_cls, badge_txt = "upd", "upd", f"Updated — {len(updated_fields)} field(s) filled"
+    elif outcome == "conflict":
+        card_cls, badge_cls, badge_txt = "conflict", "conflict", "Conflict — Pending Review"
+    elif outcome == "error":
+        card_cls, badge_cls, badge_txt = "fail", "fail", "Error"
+    elif missing:
+        card_cls, badge_cls, badge_txt = "partial", "partial", "Partial — Pass with warnings"
+    else:
+        card_cls, badge_cls, badge_txt = "pass", "pass", "Pass"
+
+    html = (
+        f'<div class="card">'
+        f'<div class="card-hdr {card_cls}">'
+        f'<span>👤 {name}</span>'
+        f'<span class="badge {badge_cls}">{badge_txt}</span>'
+        f'</div>'
+        f'<div class="fields">'
+    )
+
+    # ── Outcome-specific body ────────────────────────────────────────────────
+    if outcome == "skipped":
+        html += (
+            '<p style="margin:0;color:#555">'
+            'This candidate was <strong>not inserted</strong> because an identical record '
+            '(same details, same date, same recruiter) already exists in the database '
+            'and no new information was available to fill. No action needed.</p>'
+        )
+        html += '</div></div>'
+        return html
+
+    if outcome == "no_change":
+        html += (
+            '<p style="margin:0;color:#757575">'
+            'An existing record was found for this candidate (same recruiter, same date). '
+            'All updatable fields already have values — nothing was changed.</p>'
+        )
+        html += '</div></div>'
+        return html
+
+    if outcome == "updated":
+        html += (
+            '<p style="margin:0 0 10px;color:#0d47a1">'
+            '✏️ An existing record was found and the following previously empty fields '
+            f'have been filled: <strong>{", ".join(sorted(updated_fields))}</strong></p>'
+        )
+        html += '</div></div>'
+        return html
+
+    if outcome == "conflict":
+        conflict_id       = row_summary.get("conflict_id", "")
+        existing_recruiter = row_summary.get("existing_recruiter", "unknown")
+        html += (
+            f'<p style="margin:0;color:#4a148c">'
+            f'⚠️ This candidate already exists under recruiter <strong>{existing_recruiter}</strong>. '
+            f'A separate high-priority notification has been sent to both recruiters with '
+            f'options to update the existing record, add as new, or skip.<br>'
+            f'<small style="color:#888">Conflict ID: {conflict_id}</small></p>'
+        )
+        html += '</div></div>'
+        return html
+
+    if db_err:
+        html += (
+            f'<p style="color:#c62828"><strong>Database insert failed.</strong></p>'
+            f'<p style="font-size:12px;color:#555">Error: {db_err}</p>'
+            f'<p style="font-size:12px;color:#555">Please contact your system administrator.</p>'
+        )
+        html += '</div></div>'
+        return html
+
+    # ── Full field table (inserted / partial / error) ────────────────────────
+    html += '<table class="ft">'
+    for field in DISPLAY_ORDER:
+        label       = FIELD_LABELS.get(field, field.replace("_", " ").title())
+        raw         = rd.get(field)
+        value       = _val(raw)
+        is_required = field in REQUIRED_FIELDS
+        is_missing  = field in missing
+
+        if is_missing:
+            reason = FIELD_FAILURE_REASONS.get(field, "This field was empty or could not be extracted.")
+            html += (
+                f'<tr>'
+                f'<td><span class="icon-fail">✗</span> {label}'
+                f'{"&nbsp;<sup style=\'color:#c62828\'>required</sup>" if is_required else ""}'
+                f'</td>'
+                f'<td><span class="val-miss">Not extracted</span>'
+                f'<div class="reason">⚠ {reason}</div></td>'
+                f'</tr>'
+            )
+        else:
+            display_value = value if value else '<span style="color:#aaa">—</span>'
+            html += (
+                f'<tr>'
+                f'<td><span class="icon-ok">✓</span> {label}</td>'
+                f'<td><span class="val-ok">{display_value}</span></td>'
+                f'</tr>'
+            )
+
+    if dup:
+        dup_notes = {
+            "Duplicate":       "Same phone AND email exist. Record inserted and flagged.",
+            "Duplicate Cell":  "Same phone (different email) exists. Record inserted and flagged.",
+            "Duplicate Email": "Same email (different phone) exists. Record inserted and flagged.",
+        }
+        html += (
+            f'<tr><td colspan="2" style="padding:8px 10px;background:#fff8e1;'
+            f'border-left:3px solid #ffc107;font-size:12px;color:#5d4037">'
+            f'⚠ <strong>Duplicate Flag: {dup}</strong> — {dup_notes.get(dup, dup)}'
+            f'</td></tr>'
+        )
+
+    html += '</table></div></div>'
+    return html
+
+
+# ─── Conflict comparison table ───────────────────────────────────────────────────
+def _comparison_table_html(existing_row: dict, new_record_data: dict) -> str:
+    existing_recruiter = existing_row.get("recruiter", "—")
+    new_recruiter      = new_record_data.get("recruiter", "—")
+
+    html = (
+        f'<table class="cmp">'
+        f'<thead><tr>'
+        f'<th style="width:28%">Field</th>'
+        f'<th style="width:36%">Existing Record<br><small>(by {existing_recruiter})</small></th>'
+        f'<th style="width:36%">New Submission<br><small>(by {new_recruiter})</small></th>'
+        f'</tr></thead><tbody>'
+    )
+
+    for field in CONFLICT_COMPARE_FIELDS:
+        label    = FIELD_LABELS.get(field, field.replace("_", " ").title())
+        ex_val   = _val(existing_row.get(field))
+        new_val  = _val(new_record_data.get(field))
+        ex_disp  = ex_val  if ex_val  else '<span class="cmp-empty">empty</span>'
+        new_disp = new_val if new_val else '<span class="cmp-empty">empty</span>'
+
+        # Highlight row if values differ (ignoring case/whitespace)
+        differ = ex_val.strip().lower() != new_val.strip().lower()
+        row_cls = ' class="cmp-diff"' if differ and (ex_val or new_val) else ""
+
+        html += (
+            f'<tr{row_cls}>'
+            f'<td><strong>{label}</strong></td>'
+            f'<td>{ex_disp}</td>'
+            f'<td>{new_disp}</td>'
+            f'</tr>'
+        )
+
+    html += '</tbody></table>'
+    return html
+
+
+# ─── Standard processing report ──────────────────────────────────────────────────
+def build_email_html(
+    original_subject: str,
+    from_addr: str,
+    rows_summary: list[dict],
+    email_inserted: int,
+    email_skipped: int,
+    email_errors: int,
+    email_updated: int = 0,
+    email_conflicts: int = 0,
+) -> tuple[str, str]:
+    now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    total   = email_inserted + email_skipped + email_errors + email_updated + email_conflicts
+
+    if email_errors == 0 and email_skipped == 0 and email_conflicts == 0 and email_inserted > 0:
+        overall, hdr_cls, hdr_icon = "All Passed", "pass", "✅"
+    elif email_inserted == 0 and email_updated == 0 and email_skipped == 0 and email_conflicts == 0:
+        overall, hdr_cls, hdr_icon = "All Failed", "fail", "❌"
+    else:
+        overall, hdr_cls, hdr_icon = "Partially Processed", "partial", "⚠️"
+
+    subject_line = f"[HR Bot] {hdr_icon} {overall} — {original_subject}"
+
+    cards_html = "".join(_candidate_card_html(r) for r in rows_summary)
+    if not cards_html:
+        cards_html = (
+            '<div class="card"><div class="card-hdr fail">No candidate rows found</div>'
+            '<div class="fields"><p style="color:#c62828">No data table was found in the '
+            'email body.</p></div></div>'
+        )
+
+    # Build summary bar — only show non-zero stats to keep it clean
+    stat_blocks = [
+        ("ins",  email_inserted,  "Inserted"),
+        ("upd",  email_updated,   "Updated"),
+        ("skip", email_skipped,   "Skipped"),
+        ("conf", email_conflicts, "Conflicts"),
+        ("err",  email_errors,    "Errors"),
+    ]
+    stats_html = "".join(
+        f'<div class="stat {cls}">'
+        f'<span class="num">{count}</span>'
+        f'<span class="lbl">{lbl}</span>'
+        f'</div>'
+        for cls, count, lbl in stat_blocks
+    )
+    # Always show Total
+    stats_html += (
+        f'<div class="stat" style="background:#e8eaf6;border:1px solid #9fa8da">'
+        f'<span class="num" style="color:#283593">{total}</span>'
+        f'<span class="lbl">Total</span>'
+        f'</div>'
+    )
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>{_CSS}</style></head>
+<body><div class="wrap">
+  <div class="hdr {hdr_cls}">
+    <h1>{hdr_icon} HR Bot Processing Report</h1>
+    <p>Subject: <strong>{original_subject}</strong> &nbsp;|&nbsp;
+       Submitted by: <strong>{from_addr}</strong> &nbsp;|&nbsp;
+       Processed at: {now_str}</p>
+  </div>
+  <div class="body">
+    <div class="summary-bar">{stats_html}</div>
+    {cards_html}
+  </div>
+  <div class="footer">
+    This is an automated message from {TARGET_MAILBOX} — please do not reply directly.<br>
+    For issues, contact your system administrator or check extractor.log.
+  </div>
+</div></body></html>"""
+
+    return subject_line, html
+
+
+def send_notification_email(
+    token: str,
+    from_addr: str,
+    original_subject: str,
+    rows_summary: list[dict],
+    email_inserted: int,
+    email_skipped: int,
+    email_errors: int,
+    email_updated: int = 0,
+    email_conflicts: int = 0,
+) -> None:
+    subject_line, html_body = build_email_html(
+        original_subject, from_addr, rows_summary,
+        email_inserted, email_skipped, email_errors,
+        email_updated, email_conflicts,
+    )
+
+    cc_list = []
+    for addr in NOTIFY_CC_EMAILS.split(","):
+        addr = addr.strip()
+        if addr:
+            cc_list.append({"emailAddress": {"address": addr}})
+
+    payload = {
+        "message": {
+            "subject":      subject_line,
+            "body":         {"contentType": "HTML", "content": html_body},
+            "toRecipients": [{"emailAddress": {"address": from_addr}}],
+            "ccRecipients": cc_list,
+        },
+        "saveToSentItems": "false",
+    }
+
+    _send_graph_mail(token, payload, from_addr)
+
+
+# ─── Conflict notification (high importance) ────────────────────────────────────
+def build_conflict_email_html(
+    conflict_id: str,
+    existing_row: dict,
+    new_record_data: dict,
+    new_recruiter_addr: str,
+    existing_recruiter_addr: str,
+    original_subject: str,
+) -> tuple[str, str]:
+    """
+    Returns (subject_line, html_body) for the conflict notification.
+
+    The email contains:
+    - Side-by-side comparison of existing vs new record
+    - Three mailto action links → recruiter just clicks one and hits Send
+      Subject format the extractor listens for: [HR-ACTION] UPDATE|NEW|SKIP <conflict_id>
+    """
+    candidate_name = (
+        _val(new_record_data.get("name_of_candidate"))
+        or _val(existing_row.get("name_of_candidate"))
+        or "Unknown Candidate"
+    )
+    existing_recruiter = existing_row.get("recruiter", "—")
+    new_recruiter      = new_record_data.get("recruiter", "—")
+    now_str            = datetime.now().strftime("%d %b %Y, %I:%M %p")
+
+    subject_line = (
+        f"[HR Bot] 🚨 ACTION REQUIRED — Candidate Conflict: "
+        f"{candidate_name} | {original_subject}"
+    )
+
+    # Build mailto hrefs — recruiter clicks, email client opens with pre-filled subject
+    mailbox = TARGET_MAILBOX
+    action_update = f"mailto:{mailbox}?subject=[HR-ACTION] UPDATE {conflict_id}"
+    action_new    = f"mailto:{mailbox}?subject=[HR-ACTION] NEW {conflict_id}"
+    action_skip   = f"mailto:{mailbox}?subject=[HR-ACTION] SKIP {conflict_id}"
+
+    comparison_html = _comparison_table_html(existing_row, new_record_data)
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>{_CSS}</style></head>
+<body><div class="wrap">
+
+  <div class="hdr conflict">
+    <h1>🚨 Candidate Conflict — Action Required</h1>
+    <p>Subject: <strong>{original_subject}</strong> &nbsp;|&nbsp;
+       Detected at: {now_str}</p>
+  </div>
+
+  <div class="body">
+
+    <div class="urgent-banner">
+      ⚠️ <strong>The candidate below has been submitted by two different recruiters
+      for the same date/role.</strong><br>
+      New submission by <strong>{new_recruiter}</strong> conflicts with an existing
+      record added by <strong>{existing_recruiter}</strong>.<br>
+      <small style="opacity:.8">Conflict ID: {conflict_id}</small>
+    </div>
+
+    <h3 style="margin:0 0 12px;color:#4a148c">📋 Field Comparison</h3>
+    <p style="font-size:12px;color:#888;margin:0 0 10px">
+      🟡 Highlighted rows have different values between the two submissions.
+    </p>
+    {comparison_html}
+
+    <h3 style="margin:24px 0 8px;color:#333">📬 Choose an Action</h3>
+    <p style="font-size:13px;color:#555;margin:0 0 16px">
+      Click one of the buttons below. Your email client will open with a
+      pre-filled subject — just hit <strong>Send</strong>.
+      The bot will process your choice on its next run.
+    </p>
+
+    <div class="actions">
+      <a href="{action_update}" class="btn btn-update">
+        ✏️ Update Existing Record<br>
+        <small style="font-weight:400;font-size:11px">
+          Fill empty fields in {existing_recruiter}'s record
+        </small>
+      </a>
+      <a href="{action_new}" class="btn btn-new">
+        ➕ Add as New Record<br>
+        <small style="font-weight:400;font-size:11px">
+          Insert {new_recruiter}'s submission separately
+        </small>
+      </a>
+      <a href="{action_skip}" class="btn btn-skip">
+        ⏭ Skip / Ignore<br>
+        <small style="font-weight:400;font-size:11px">
+          Discard the new submission
+        </small>
+      </a>
+    </div>
+
+    <p style="font-size:12px;color:#888;margin:16px 0 0">
+      <strong>Note:</strong> "Update Existing Record" will only fill fields that are
+      currently empty — it will never overwrite data that already exists.
+    </p>
+
+  </div>
+
+  <div class="footer">
+    This is an automated urgent notification from {TARGET_MAILBOX}.<br>
+    Reply by clicking one of the action buttons above — do not reply manually.<br>
+    Conflict ID: {conflict_id}
+  </div>
+
+</div></body></html>"""
+
+    return subject_line, html
+
+
+def send_conflict_notification_email(
+    token: str,
+    new_recruiter_addr: str,
+    existing_recruiter_addr: str,
+    conflict_id: str,
+    existing_row: dict,
+    new_record_data: dict,
+    original_subject: str,
+) -> None:
+    """
+    Send a HIGH-IMPORTANCE conflict notification to both recruiters.
+    The new recruiter is To:; the existing recruiter is CC:.
+    CC list (team lead / manager) is also included.
+    """
+    subject_line, html_body = build_conflict_email_html(
+        conflict_id, existing_row, new_record_data,
+        new_recruiter_addr, existing_recruiter_addr,
+        original_subject,
+    )
+
+    # CC: existing recruiter + standard CC list
+    cc_list = []
+    if existing_recruiter_addr and existing_recruiter_addr != new_recruiter_addr:
+        cc_list.append({"emailAddress": {"address": existing_recruiter_addr}})
+    for addr in NOTIFY_CC_EMAILS.split(","):
+        addr = addr.strip()
+        if addr:
+            cc_list.append({"emailAddress": {"address": addr}})
+
+    payload = {
+        "message": {
+            "subject":      subject_line,
+            "importance":   "high",              # ← marks email as Important/Urgent in Outlook
+            "flag":         {"flagStatus": "flagged"},  # ← also flags it in the inbox
+            "body":         {"contentType": "HTML", "content": html_body},
+            "toRecipients": [{"emailAddress": {"address": new_recruiter_addr}}],
+            "ccRecipients": cc_list,
+        },
+        "saveToSentItems": "false",
+    }
+
+    _send_graph_mail(token, payload, new_recruiter_addr, label="conflict notification")
+
+
+# ─── Shared Graph send helper ────────────────────────────────────────────────────
+def _send_graph_mail(
+    token: str,
+    payload: dict,
+    primary_recipient: str,
+    label: str = "notification",
+) -> None:
+    url  = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/sendMail"
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type":  "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+    if resp.status_code == 202:
+        log.info(f"  ✉ {label} sent → {primary_recipient}")
+    else:
+        log.error(
+            f"  ✉ {label} failed for {primary_recipient}: "
+            f"{resp.status_code} — {resp.text[:300]}"
+        )
