@@ -687,7 +687,7 @@ def check_duplicate(cur, contact_number: str, email_id: str) -> str:
 
     if contact_number and email_id:
         cur.execute(
-            pgsql.SQL("SELECT 1 FROM {t} WHERE contact_number=%s AND email_id=%s LIMIT 1").format(t=tbl),
+            pgsql.SQL("SELECT 1 FROM {t} WHERE jr_no=%s OR general_skill=%s AND contact_number=%s AND email_id=%s LIMIT 1").format(t=tbl),
             (contact_number, email_id),
         )
         if cur.fetchone():
