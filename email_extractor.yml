@@ -19,7 +19,8 @@ jobs:
       AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
       TARGET_MAILBOX:      ${{ secrets.TARGET_MAILBOX }}
       DB_DSN:              ${{ secrets.DB_DSN }}
-      DB_TABLE_NAME:       ${{ secrets.DB_table }}
+      DB_TABLE_NAME:       ${{ secrets.DB_TABLE_NAME }}
+     # ONEDRIVE_FOLDER:     ${{ secrets.ONEDRIVE_FOLDER }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
