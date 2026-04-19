@@ -723,14 +723,29 @@ def _extract_address(addr_obj: dict) -> str:
     except (KeyError, TypeError):
         return ""
 
+def _normalize_name_from_email(email: str) -> str:
+    if not email or "@" not in email:
+        return ""
+
+    local = email.split("@", 1)[0]
+
+    # Remove numbers
+    local = re.sub(r"\d+", "", local)
+
+    # Replace separators with space
+    local = re.sub(r"[._\-]+", " ", local)
+
+    # Remove extra spaces
+    local = re.sub(r"\s+", " ", local).strip()
+
+    # Capitalize each word
+    return local.title()
 
 def _recruiter_name(email: str) -> str:
-    return email.split("@", 1)[0].strip() if "@" in email else email.strip()
-
+    return _normalize_name_from_email(email)
 
 def _username_from_email(email: str) -> str:
-    return email.split("@", 1)[0].strip() if "@" in email else email.strip()
-
+    return _normalize_name_from_email(email)
 
 def _delivery_type(from_addr: str, to_addr: str) -> str:
     return (
