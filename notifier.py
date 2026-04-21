@@ -325,11 +325,10 @@ def _candidate_card_html(row_summary: dict) -> str:
 
         if is_missing:
             reason = FIELD_FAILURE_REASONS.get(field, "This field was empty or could not be extracted.")
+            required_sup = '&nbsp;<sup style="color:#c62828">required</sup>' if is_required else ""
             html += (
                 f'<tr>'
-                f'<td><span class="icon-fail">✗</span> {label}'
-                f'{"&nbsp;<sup style=\'color:#c62828\'>required</sup>" if is_required else ""}'
-                f'</td>'
+                f'<td><span class="icon-fail">✗</span> {label}{required_sup}</td>'
                 f'<td><span class="val-miss">Not extracted</span>'
                 f'<div class="reason">⚠ {reason}</div></td>'
                 f'</tr>'
