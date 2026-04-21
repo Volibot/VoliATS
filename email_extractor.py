@@ -61,6 +61,10 @@ DB_DSN              = os.environ["DB_DSN"]
 DB_TABLE            = os.environ.get("DB_TABLE_NAME", "hrvolibit")
 ONEDRIVE_FOLDER     = os.environ.get("ONEDRIVE_FOLDER", "HR Resumes")
 
+# Subfolder inside the target mailbox to read candidate emails from.
+# Set to empty string "" to read from the root inbox instead.
+INBOX_SUBFOLDER     = os.environ.get("INBOX_SUBFOLDER", "Company Profiles")
+
 VOLIBITS_DOMAIN     = "volibits.com"
 RESUME_EXTENSIONS   = {".pdf", ".doc", ".docx"}
 
@@ -209,10 +213,70 @@ def get_onedrive_token() -> str:
 
 
 # ─── Fetch & mark emails ─────────────────────────────────────────────────────────
-def fetch_emails(token: str, top: int = 50) -> list[dict]:
+# ─── Folder resolution ───────────────────────────────────────────────────────────
+def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
+    """
+    Return the Graph API folder ID for a named subfolder inside the target mailbox.
+    Checks top-level mailFolders first; if not found, searches one level of
+    child folders (handles Inbox > Company Profiles nesting).
+    Returns None if the folder cannot be found (caller falls back to root inbox).
+    """
+    if not folder_name:
+        return None
+
     headers = {"Authorization": f"Bearer {token}"}
+
+    # ── Search top-level folders ──────────────────────────────────────────────
     url = (
-        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages"
+        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/mailFolders"
+        f"?$select=id,displayName&$top=50"
+    )
+    resp = requests.get(url, headers=headers, timeout=15)
+    if not resp.ok:
+        log.warning(f"resolve_folder_id: mailFolders fetch failed {resp.status_code}")
+        return None
+
+    for folder in resp.json().get("value", []):
+        if folder.get("displayName", "").strip().lower() == folder_name.strip().lower():
+            log.info(f"Resolved folder {folder_name!r} → id={folder['id']}")
+            return folder["id"]
+
+        # ── Search one level of child folders ────────────────────────────────
+        child_url = (
+            f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
+            f"/mailFolders/{folder['id']}/childFolders"
+            f"?$select=id,displayName&$top=50"
+        )
+        child_resp = requests.get(child_url, headers=headers, timeout=15)
+        if not child_resp.ok:
+            continue
+        for child in child_resp.json().get("value", []):
+            if child.get("displayName", "").strip().lower() == folder_name.strip().lower():
+                log.info(
+                    f"Resolved folder {folder_name!r} under {folder['displayName']!r} "
+                    f"→ id={child['id']}"
+                )
+                return child["id"]
+
+    log.warning(f"resolve_folder_id: folder {folder_name!r} not found — using root inbox")
+    return None
+
+
+def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> list[dict]:
+    headers = {"Authorization": f"Bearer {token}"}
+    # Use the specific subfolder endpoint when a folder ID is available;
+    # fall back to the root messages endpoint otherwise.
+    if folder_id:
+        base = (
+            f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
+            f"/mailFolders/{folder_id}/messages"
+        )
+        log.info(f"Fetching from folder id={folder_id}")
+    else:
+        base = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages"
+        log.info("Fetching from root inbox (no subfolder configured or resolved)")
+    url = (
+        f"{base}"
         f"?$top={top}"
         f"&$select=id,subject,from,toRecipients,ccRecipients,"
         f"body,receivedDateTime,isRead,hasAttachments"
@@ -975,10 +1039,14 @@ def process_emails() -> None:
     log.info("=== HR Email Extractor starting ===")
     log.info(f"Target table   : {DB_TABLE}")
     log.info(f"OneDrive folder: {ONEDRIVE_FOLDER}")
+    log.info(f"Inbox subfolder: {INBOX_SUBFOLDER or '(root inbox)'}")
 
     token    = get_mail_token()
     od_token = get_onedrive_token()
     log.info("Tokens obtained.")
+
+    # Resolve the target subfolder ID once at startup
+    inbox_folder_id = resolve_folder_id(token, INBOX_SUBFOLDER) if INBOX_SUBFOLDER else None
 
     conn = psycopg2.connect(DB_DSN)
     conn.autocommit = False
@@ -991,7 +1059,7 @@ def process_emails() -> None:
     # ── Resolve any pending conflict action-replies first ────────────────────
     process_action_replies(token, cur, conn)
 
-    emails = fetch_emails(token)
+    emails = fetch_emails(token, folder_id=inbox_folder_id)
     log.info(f"Fetched {len(emails)} unread email(s).")
 
     processed = skipped = inserted = updated = conflicts = errors = 0
@@ -1223,13 +1291,10 @@ def process_emails() -> None:
                 contact_number or "",
                 email_id_val   or "",
             )
-            contact_dup_flag = "Duplicate Contact" if contact_dup is not None else ""
+            # contact_dup is notification-only — never written to is_duplicate
 
             # ── TIER 3: No matching record — standard insert path ────────────
             dup_flag = check_duplicate(cur, contact_number or "", email_id_val or "")
-            # Merge contact-only duplicate flag if no stronger flag already set
-            if not dup_flag and contact_dup_flag:
-                dup_flag = contact_dup_flag
 
             record_data = {
                 "recruiter":           _t(recruiter),
@@ -1281,7 +1346,7 @@ def process_emails() -> None:
                     f"recruiter={recruiter} | dup={dup_flag or 'none'}"
                 )
                 # Notify manager + both recruiters when contact-only duplicate detected
-                if dup_flag == "Duplicate Contact" and contact_dup is not None:
+                if contact_dup is not None:
                     send_diff_recruiter_notification_email(
                         token=token,
                         new_recruiter_addr=from_addr,
