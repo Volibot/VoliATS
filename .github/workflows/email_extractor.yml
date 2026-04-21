@@ -2,10 +2,8 @@ name: HR Email Extractor
 
 on:
   schedule:
-    # Runs every 5 minutes — GitHub's minimum interval
     - cron: "*/5 * * * *"
   workflow_dispatch:
-    # Manual trigger from the Actions tab
 
 jobs:
   extract-emails:
@@ -14,13 +12,21 @@ jobs:
     timeout-minutes: 10
 
     env:
+      # Mail-reading app
       AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
       AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      # OneDrive upload app (separate registration with Files.ReadWrite)
+      OD_TENANT_ID:        ${{ secrets.OD_TENANT_ID }}
+      OD_CLIENT_ID:        ${{ secrets.OD_CLIENT_ID }}
+      OD_CLIENT_SECRET:    ${{ secrets.OD_CLIENT_SECRET }}
+      # Shared config
       TARGET_MAILBOX:      ${{ secrets.TARGET_MAILBOX }}
       DB_DSN:              ${{ secrets.DB_DSN }}
       DB_TABLE_NAME:       ${{ secrets.DB_TABLE_NAME }}
-     # ONEDRIVE_FOLDER:     ${{ secrets.ONEDRIVE_FOLDER }}
+      ONEDRIVE_FOLDER:     ${{ secrets.ONEDRIVE_FOLDER }}
+      NOTIFY_CC_EMAILS:    ${{ secrets.NOTIFY_CC_EMAILS }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

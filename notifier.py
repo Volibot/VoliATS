@@ -30,6 +30,8 @@ log = logging.getLogger(__name__)
 
 TARGET_MAILBOX   = os.environ["TARGET_MAILBOX"]
 NOTIFY_CC_EMAILS = os.environ.get("NOTIFY_CC_EMAILS", "")
+# Manager emails CC'd specifically on recruiter-level duplicate notifications
+DIFF_RECRUITER_MANAGER_EMAILS = os.environ.get("DIFF_RECRUITER_MANAGER_EMAILS", "")
 
 
 # ─── Human-readable field labels ────────────────────────────────────────────────
@@ -205,6 +207,14 @@ _CSS = """
                    border-radius:6px; margin-bottom:20px; font-size:14px; }
   .footer { padding:16px 32px; background:#f8f9fa; font-size:11px;
             color:#9e9e9e; border-top:1px solid #e0e0e0; }
+  /* Duplicate-specific card headers */
+  .card-hdr.dup-recruiter { background:#ffebee; color:#7f0000; border-bottom:1px solid #ffcdd2; }
+  .card-hdr.dup-contact   { background:#fff3e0; color:#bf360c; border-bottom:1px solid #ffe0b2; }
+  .badge.dup-recruiter    { background:#c62828; color:#fff; }
+  .badge.dup-contact      { background:#e65100; color:#fff; }
+  /* Red inline dup banner */
+  .dup-banner-red    { background:#ffebee; border-left:3px solid #ef5350; }
+  .dup-banner-orange { background:#fff3e0; border-left:3px solid #ffa726; }
 """
 
 
@@ -235,6 +245,10 @@ def _candidate_card_html(row_summary: dict) -> str:
         card_cls, badge_cls, badge_txt = "conflict", "conflict", "Conflict — Pending Review"
     elif outcome == "error":
         card_cls, badge_cls, badge_txt = "fail", "fail", "Error"
+    elif dup in ("Duplicate Recruiter",) and outcome == "inserted":
+        card_cls, badge_cls, badge_txt = "dup-recruiter", "dup-recruiter", "Inserted — Duplicate Recruiter"
+    elif dup in ("Duplicate Contact",) and outcome == "inserted":
+        card_cls, badge_cls, badge_txt = "dup-contact", "dup-contact", "Inserted — Duplicate Contact"
     elif missing:
         card_cls, badge_cls, badge_txt = "partial", "partial", "Partial — Pass with warnings"
     else:
@@ -330,15 +344,28 @@ def _candidate_card_html(row_summary: dict) -> str:
             )
 
     if dup:
-        dup_notes = {
-            "Duplicate":       "Same phone AND email exist. Record inserted and flagged.",
-            "Duplicate Cell":  "Same phone (different email) exists. Record inserted and flagged.",
-            "Duplicate Email": "Same email (different phone) exists. Record inserted and flagged.",
+        dup_meta = {
+            "Duplicate":          ("🔴", "#ffebee", "#ef5350", "#7f0000",
+                                   "Same phone AND email already exist in the DB. Record inserted and flagged."),
+            "Duplicate Cell":     ("🟠", "#fff3e0", "#ffa726", "#5d4037",
+                                   "Same phone number already exists (different email). Record inserted and flagged."),
+            "Duplicate Email":    ("🟠", "#fff3e0", "#ffa726", "#5d4037",
+                                   "Same email address already exists (different phone). Record inserted and flagged."),
+            "Duplicate Recruiter":("🔴", "#ffebee", "#ef5350", "#7f0000",
+                                   "Same candidate (phone + email + JR/skill) was already submitted by a different "
+                                   "recruiter within the duplicate check window. Record inserted and flagged. "
+                                   "Both recruiters and manager have been notified."),
+            "Duplicate Contact":  ("🟠", "#fff3e0", "#ffa726", "#5d4037",
+                                   "Same phone or email exists in the DB under a different JR/skill or recruiter "
+                                   "within the duplicate check window. Record inserted and flagged."),
         }
+        icon, bg, border, txt_color, note = dup_meta.get(
+            dup, ("⚠️", "#fff8e1", "#ffc107", "#5d4037", dup)
+        )
         html += (
-            f'<tr><td colspan="2" style="padding:8px 10px;background:#fff8e1;'
-            f'border-left:3px solid #ffc107;font-size:12px;color:#5d4037">'
-            f'⚠ <strong>Duplicate Flag: {dup}</strong> — {dup_notes.get(dup, dup)}'
+            f'<tr><td colspan="2" style="padding:8px 10px;background:{bg};'
+            f'border-left:3px solid {border};font-size:12px;color:{txt_color}">'
+            f'{icon} <strong>Duplicate Flag: {dup}</strong> — {note}'
             f'</td></tr>'
         )
 
@@ -604,6 +631,113 @@ def build_conflict_email_html(
 </div></body></html>"""
 
     return subject_line, html
+
+
+
+def send_diff_recruiter_notification_email(
+    token: str,
+    new_recruiter_addr: str,
+    existing_recruiter_addr: str,
+    existing_row: dict,
+    new_record_data: dict,
+    original_subject: str,
+    jr_no: str,
+    inserted_ok: bool,
+) -> None:
+    """
+    Send an informational FYI email when the same candidate has been submitted
+    by a different recruiter.  The new record is already inserted — no action
+    is needed from either recruiter.  Both recruiters are notified.
+    """
+    candidate_name = (
+        _val(new_record_data.get("name_of_candidate"))
+        or _val(existing_row.get("name_of_candidate"))
+        or "Unknown Candidate"
+    )
+    existing_recruiter = existing_row.get("recruiter", "—")
+    new_recruiter      = new_record_data.get("recruiter", "—")
+    insert_date        = _val(new_record_data.get("date")) or datetime.now().strftime("%d %b %Y")
+    now_str            = datetime.now().strftime("%d %b %Y, %I:%M %p")
+
+    status_line = (
+        "The record has been added to the database."
+        if inserted_ok
+        else "The record could not be inserted — please contact your administrator."
+    )
+
+    subject_line = (
+        f"[HR Bot] Candidate added by multiple recruiters — "
+        f"{candidate_name} | {original_subject}"
+    )
+
+    comparison_html = _comparison_table_html(existing_row, new_record_data)
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>{_CSS}</style></head>
+<body><div class="wrap">
+
+  <div class="hdr" style="background:#1565c0">
+    <h1>FYI: Candidate Submitted by Multiple Recruiters</h1>
+    <p>Subject: <strong>{original_subject}</strong> &nbsp;|&nbsp;
+       Detected at: {now_str}</p>
+  </div>
+
+  <div class="body">
+
+    <div style="background:#e3f2fd;border:1px solid #90caf9;border-radius:6px;
+                padding:14px 20px;margin-bottom:20px;font-size:14px;color:#0d47a1">
+      <strong>FYI — no action required.</strong><br>
+      The candidate <strong>{candidate_name}</strong> was submitted for
+      <strong>{jr_no}</strong> on <strong>{insert_date}</strong>
+      by recruiter <strong>{new_recruiter}</strong>.<br>
+      An earlier record for the same candidate already exists, added by
+      <strong>{existing_recruiter}</strong>.<br><br>
+      {status_line}
+    </div>
+
+    <h3 style="margin:0 0 12px;color:#1565c0">Field Comparison</h3>
+    <p style="font-size:12px;color:#888;margin:0 0 10px">
+      Highlighted rows have different values between the two submissions.
+    </p>
+    {comparison_html}
+
+  </div>
+
+  <div class="footer">
+    This is an automated informational message from {TARGET_MAILBOX}.<br>
+    No action is required — the record has been added automatically.
+  </div>
+
+</div></body></html>"""
+
+    cc_list: list = []
+    # CC the existing recruiter so both parties are informed
+    if existing_recruiter_addr and existing_recruiter_addr != new_recruiter_addr:
+        cc_list.append({"emailAddress": {"address": existing_recruiter_addr}})
+    # Standard CC list (team lead etc.)
+    for addr in NOTIFY_CC_EMAILS.split(","):
+        addr = addr.strip()
+        if addr:
+            cc_list.append({"emailAddress": {"address": addr}})
+    # Manager-specific CC for recruiter-level duplicate alerts
+    _existing_cc_addrs = {r["emailAddress"]["address"] for r in cc_list}
+    for addr in DIFF_RECRUITER_MANAGER_EMAILS.split(","):
+        addr = addr.strip()
+        if addr and addr not in _existing_cc_addrs:
+            cc_list.append({"emailAddress": {"address": addr}})
+            _existing_cc_addrs.add(addr)
+
+    payload = {
+        "message": {
+            "subject":      subject_line,
+            "body":         {"contentType": "HTML", "content": html},
+            "toRecipients": [{"emailAddress": {"address": new_recruiter_addr}}],
+            "ccRecipients": cc_list,
+        },
+        "saveToSentItems": "false",
+    }
+
+    _send_graph_mail(token, payload, new_recruiter_addr, label="diff-recruiter notification")
 
 
 def send_conflict_notification_email(

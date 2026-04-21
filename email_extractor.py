@@ -29,7 +29,11 @@ from psycopg2 import sql as pgsql
 from datetime import datetime, date
 from typing import Optional
 from msal import ConfidentialClientApplication
-from notifier import send_notification_email, send_conflict_notification_email
+from notifier import (
+    send_notification_email,
+    send_conflict_notification_email,
+    send_diff_recruiter_notification_email,
+)
 
 # ─── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -59,6 +63,10 @@ ONEDRIVE_FOLDER     = os.environ.get("ONEDRIVE_FOLDER", "HR Resumes")
 
 VOLIBITS_DOMAIN     = "volibits.com"
 RESUME_EXTENSIONS   = {".pdf", ".doc", ".docx"}
+
+# Number of months of history to consider when checking for duplicates.
+# Increase or decrease this value in your secrets/env as needed.
+DUPLICATE_CHECK_MONTHS = int(os.environ.get("DUPLICATE_CHECK_MONTHS", "3"))
 
 # Fields that may be auto-filled when NULL/empty in an existing record.
 # Identity and routing fields are intentionally excluded — they are never changed.
@@ -406,6 +414,55 @@ def ensure_tables(cur) -> None:
             new_record_data     TEXT
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS hr_processed_emails (
+            message_id    TEXT PRIMARY KEY,
+            processed_at  TIMESTAMP DEFAULT NOW(),
+            subject       TEXT,
+            from_addr     TEXT,
+            outcome       TEXT,
+            rows_inserted INTEGER DEFAULT 0,
+            rows_updated  INTEGER DEFAULT 0,
+            rows_errors   INTEGER DEFAULT 0
+        )
+    """)
+
+
+# ─── Processed-email tracking ──────────────────────────────────────────────────
+def is_email_processed(cur, message_id: str) -> bool:
+    """Return True if this message_id has already been committed to hr_processed_emails."""
+    cur.execute(
+        "SELECT 1 FROM hr_processed_emails WHERE message_id = %s LIMIT 1",
+        (message_id,),
+    )
+    return cur.fetchone() is not None
+
+
+def mark_email_processed(
+    cur,
+    message_id: str,
+    subject: str,
+    from_addr: str,
+    outcome: str,
+    rows_inserted: int = 0,
+    rows_updated: int = 0,
+    rows_errors: int = 0,
+) -> None:
+    """Record that this message_id has been fully processed.
+    Called just before conn.commit() so it rolls back together if the commit fails.
+    Uses ON CONFLICT DO NOTHING — safe to call more than once (e.g. action-reply emails).
+    """
+    cur.execute(
+        """
+        INSERT INTO hr_processed_emails
+            (message_id, subject, from_addr, outcome,
+             rows_inserted, rows_updated, rows_errors)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (message_id) DO NOTHING
+        """,
+        (message_id, subject, from_addr, outcome,
+         rows_inserted, rows_updated, rows_errors),
+    )
 
 
 # ─── Smart duplicate detection & update ─────────────────────────────────────────
@@ -429,10 +486,11 @@ def find_same_key_record(
     submitted by the same recruiter/client pair with the same delivery type.
 
     Match criteria:
-      date, contact_number, email_id,
+      date (same day), contact_number, email_id,
       jr_no OR general_skill,
       client_recruiter, recruiter, delivery_type
 
+    Duplicate check is restricted to the last DUPLICATE_CHECK_MONTHS months.
     Returns a dict of {col: value} including 'id', or None.
     """
     if not contact_number and not email_id:
@@ -442,6 +500,7 @@ def find_same_key_record(
     query = pgsql.SQL("""
         SELECT {cols} FROM {table}
         WHERE date = %s
+          AND date >= CURRENT_DATE - (INTERVAL '1 month' * %s)
           AND LOWER(COALESCE(contact_number,   '')) = LOWER(COALESCE(%s, ''))
           AND LOWER(COALESCE(email_id,         '')) = LOWER(COALESCE(%s, ''))
           AND (LOWER(COALESCE(jr_no,           '')) = LOWER(COALESCE(%s, ''))
@@ -455,7 +514,8 @@ def find_same_key_record(
         table=pgsql.Identifier(DB_TABLE),
     )
     cur.execute(query, (
-        row_date, contact_number, email_id,
+        row_date, DUPLICATE_CHECK_MONTHS,
+        contact_number, email_id,
         jr_no, general_skill,
         client_recruiter, recruiter, delivery_type,
     ))
@@ -476,6 +536,8 @@ def find_different_recruiter_record(
     """
     Find an existing record with the same candidate/JR identity but submitted
     by a DIFFERENT recruiter or client pair.
+
+    Duplicate check is restricted to the last DUPLICATE_CHECK_MONTHS months.
     Returns a dict including 'id', 'recruiter', 'client_recruiter',
     'name_of_candidate', 'email_from', plus all UPDATABLE_FIELDS, or None.
     """
@@ -485,7 +547,7 @@ def find_different_recruiter_record(
     cols  = ["id", "recruiter", "client_recruiter", "name_of_candidate", "email_from"] + UPDATABLE_FIELDS
     query = pgsql.SQL("""
         SELECT {cols} FROM {table}
-        WHERE date = %s
+        WHERE date >= CURRENT_DATE - (INTERVAL '1 month' * %s)
           AND LOWER(COALESCE(contact_number,   '')) = LOWER(COALESCE(%s, ''))
           AND LOWER(COALESCE(email_id,         '')) = LOWER(COALESCE(%s, ''))
           AND (LOWER(COALESCE(jr_no,           '')) = LOWER(COALESCE(%s, ''))
@@ -498,9 +560,52 @@ def find_different_recruiter_record(
         table=pgsql.Identifier(DB_TABLE),
     )
     cur.execute(query, (
-        row_date, contact_number, email_id,
+        DUPLICATE_CHECK_MONTHS,
+        contact_number, email_id,
         jr_no, general_skill,
         recruiter, client_recruiter,
+    ))
+    row = cur.fetchone()
+    return dict(zip(cols, row)) if row else None
+
+
+
+def find_contact_email_only_duplicate(
+    cur,
+    contact_number: str,
+    email_id: str,
+) -> Optional[dict]:
+    """
+    TIER 2.5 — broad identity check: same contact_number OR same email_id,
+    regardless of JR/skill or recruiter.  Used to flag candidates who appear
+    in the system under a completely different role or recruiter within the
+    last DUPLICATE_CHECK_MONTHS months.
+
+    Either contact_number OR email_id is sufficient to match (OR logic).
+    Returns a minimal dict with 'id', 'recruiter', 'name_of_candidate',
+    'jr_no', 'general_skill', 'date', or None.
+    """
+    if not contact_number and not email_id:
+        return None
+
+    cols  = ["id", "recruiter", "name_of_candidate", "jr_no", "general_skill", "date"]
+    query = pgsql.SQL("""
+        SELECT {cols} FROM {table}
+        WHERE date >= CURRENT_DATE - (INTERVAL '1 month' * %s)
+          AND (
+            (LOWER(COALESCE(contact_number, '')) = LOWER(COALESCE(%s, '')) AND %s != '')
+            OR
+            (LOWER(COALESCE(email_id,       '')) = LOWER(COALESCE(%s, '')) AND %s != '')
+          )
+        LIMIT 1
+    """).format(
+        cols=pgsql.SQL(", ").join(pgsql.Identifier(c) for c in cols),
+        table=pgsql.Identifier(DB_TABLE),
+    )
+    cur.execute(query, (
+        DUPLICATE_CHECK_MONTHS,
+        contact_number, contact_number,
+        email_id,       email_id,
     ))
     row = cur.fetchone()
     return dict(zip(cols, row)) if row else None
@@ -605,10 +710,17 @@ def process_action_replies(token: str, cur, conn) -> None:
         return
 
     for msg in resp.json().get("value", []):
-        subject = (msg.get("subject") or "").strip()
-        m       = ACTION_REPLY_RE.match(subject)
+        subject    = (msg.get("subject") or "").strip()
+        message_id = msg["id"]
+        m          = ACTION_REPLY_RE.match(subject)
         if not m:
             continue   # Not an action reply — leave for normal processing
+
+        # Skip if this action-reply email was already processed
+        if is_email_processed(cur, message_id):
+            log.info(f"Action reply already processed — skipping {message_id}")
+            mark_email_read(token, message_id)
+            continue
 
         action      = m.group(1).upper()
         conflict_id = m.group(2)
@@ -668,42 +780,53 @@ def process_action_replies(token: str, cur, conn) -> None:
                 "WHERE conflict_id=%s",
                 (action, conflict_id),
             )
+            mark_email_processed(
+                cur,
+                message_id=message_id,
+                subject=subject,
+                from_addr=sender,
+                outcome=f"action_{action.lower()}",
+            )
             conn.commit()
 
         except Exception as exc:
             log.error(f"Action reply processing failed for {conflict_id}: {exc}")
             conn.rollback()
 
-        mark_email_read(token, msg["id"])
+        mark_email_read(token, message_id)
 
 
 # ─── Standard duplicate flag (for is_duplicate column) ──────────────────────────
 def check_duplicate(cur, contact_number: str, email_id: str) -> str:
-    """Returns 'Duplicate', 'Duplicate Cell', 'Duplicate Email', or ''."""
+    """Returns 'Duplicate', 'Duplicate Cell', 'Duplicate Email', or ''.
+
+    Only considers records added within the last DUPLICATE_CHECK_MONTHS months.
+    'Duplicate' means both contact_number AND email_id match an existing record.
+    'Duplicate Cell' means only contact_number matches.
+    'Duplicate Email' means only email_id matches.
+    """
     if not contact_number and not email_id:
         return ""
 
     tbl = pgsql.Identifier(DB_TABLE)
 
-    if contact_number and email_id:
-        cur.execute(
-            pgsql.SQL("SELECT 1 FROM {t} WHERE jr_no=%s OR general_skill=%s AND contact_number=%s AND email_id=%s LIMIT 1").format(t=tbl),
-            (contact_number, email_id),
-        )
-        if cur.fetchone():
-            return "Duplicate"
-
     cell_dup = email_dup = False
     if contact_number:
         cur.execute(
-            pgsql.SQL("SELECT 1 FROM {t} WHERE contact_number=%s LIMIT 1").format(t=tbl),
-            (contact_number,),
+            pgsql.SQL(
+                "SELECT 1 FROM {t} WHERE contact_number = %s"
+                " AND date >= CURRENT_DATE - (INTERVAL '1 month' * %s) LIMIT 1"
+            ).format(t=tbl),
+            (contact_number, DUPLICATE_CHECK_MONTHS),
         )
         cell_dup = bool(cur.fetchone())
     if email_id:
         cur.execute(
-            pgsql.SQL("SELECT 1 FROM {t} WHERE email_id=%s LIMIT 1").format(t=tbl),
-            (email_id,),
+            pgsql.SQL(
+                "SELECT 1 FROM {t} WHERE email_id = %s"
+                " AND date >= CURRENT_DATE - (INTERVAL '1 month' * %s) LIMIT 1"
+            ).format(t=tbl),
+            (email_id, DUPLICATE_CHECK_MONTHS),
         )
         email_dup = bool(cur.fetchone())
 
@@ -874,11 +997,18 @@ def process_emails() -> None:
     processed = skipped = inserted = updated = conflicts = errors = 0
 
     for msg in emails:
-        subject = msg.get("subject", "").strip()
+        subject    = msg.get("subject", "").strip()
+        message_id = msg["id"]
+
+        # Skip emails already committed to hr_processed_emails
+        if is_email_processed(cur, message_id):
+            log.info(f"Already processed — skipping {message_id} | {subject!r}")
+            mark_email_read(token, message_id)
+            continue
 
         # Skip [HR-ACTION] emails — already handled above
         if ACTION_REPLY_RE.match(subject):
-            mark_email_read(token, msg["id"])
+            mark_email_read(token, message_id)
             continue
 
         log.info(f"Subject: {subject!r}")
@@ -921,7 +1051,18 @@ def process_emails() -> None:
         email_updated  = email_conflicts = 0
 
         for row in rows:
-            row_date        = _parse_date(row["date"]) if row.get("date") else email_date
+            row_date        = _parse_date(row["date"]) if row.get("date") else None
+            # If the date column is absent or unparseable, default to today
+            # (the date the record is being added to the DB).
+            if row_date is None:
+                row_date = date.today()
+                if row.get("date"):
+                    log.warning(
+                        f"Unparseable date value {row['date']!r} — "
+                        f"defaulting to today ({row_date})"
+                    )
+                else:
+                    log.debug(f"No date in row — defaulting to today ({row_date})")
             contact_number  = _t(row.get("contact_number"))
             email_id_val    = _t(row.get("email_id"))
             effective_jr_no = _t(row.get("jr_no")) or subject_jr_no
@@ -982,7 +1123,7 @@ def process_emails() -> None:
                 })
                 continue
 
-            # ── TIER 2: Different recruiter — conflict resolution required ───
+            # ── TIER 2: Different recruiter — insert immediately, notify ────
             diff_key = find_different_recruiter_record(
                 cur, row_date,
                 contact_number  or "",
@@ -994,8 +1135,7 @@ def process_emails() -> None:
             )
 
             if diff_key is not None:
-                conflict_id = str(uuid.uuid4())
-
+                # Insert the new record straight away — no waiting required.
                 new_record_data = {
                     "recruiter":           _t(recruiter),
                     "date":                row_date,
@@ -1018,56 +1158,78 @@ def process_emails() -> None:
                     "delivery_type":       delivery_type,
                     "company_name":        company_name,
                     "attachment":          _t(attachment_str),
-                    "is_duplicate":        "Conflict",
+                    "is_duplicate":        "Duplicate Recruiter",
                     "created_by":          _t(from_addr),
                     "created_date":        now,
                     "modified_by":         _t(from_addr),
                     "modified_date":       now,
                     "remarks":             _t(row.get("remarks")),
-                    "record_status":       "Pending",
-                    "status":              "Screen Pending",
+                    "record_status":       _record_status({
+                        "name_of_candidate": candidate_name,
+                        "contact_number":    contact_number,
+                        "email_id":          email_id_val,
+                        "general_skill":     _t(general_skill),
+                        "company_name":      company_name,
+                        "recruiter":         _t(recruiter),
+                        "email_from":        _t(from_addr),
+                        "email_to":          _t(to_addr),
+                    }),
+                    "status": "Screen Pending",
                 }
 
-                store_pending_conflict(cur, conflict_id, diff_key, new_record_data)
+                ok = insert_record(cur, new_record_data)
+                if ok:
+                    inserted += 1
+                    email_inserted += 1
+                    log.info(
+                        f"  ✓ [DIFF-RECRUITER] Inserted {candidate_name or '(unknown)'} "
+                        f"by recruiter={recruiter}; also exists under {diff_key.get('recruiter')}"
+                    )
+                else:
+                    errors += 1
+                    email_errors += 1
+                    log.error(f"  ✗ [DIFF-RECRUITER] Insert failed for {candidate_name}")
 
-                # Reconstruct full email for existing recruiter (always @volibits.com)
-                existing_email_from = diff_key.get("email_from") or (
-                    diff_key.get("recruiter", "") + "@" + VOLIBITS_DOMAIN
-                )
-
-                send_conflict_notification_email(
+                # Send informational notification — no action needed from recruiters.
+                send_diff_recruiter_notification_email(
                     token=token,
                     new_recruiter_addr=from_addr,
-                    existing_recruiter_addr=existing_email_from,
-                    conflict_id=conflict_id,
+                    existing_recruiter_addr=(
+                        diff_key.get("email_from")
+                        or (diff_key.get("recruiter", "") + "@" + VOLIBITS_DOMAIN)
+                    ),
                     existing_row=diff_key,
                     new_record_data=new_record_data,
                     original_subject=subject,
-                )
-
-                email_conflicts += 1
-                conflicts += 1
-                log.info(
-                    f"  ⚠ Conflict raised for {candidate_name} — "
-                    f"existing recruiter: {diff_key.get('recruiter')} | "
-                    f"conflict_id: {conflict_id}"
+                    jr_no=effective_jr_no or general_skill or "",
+                    inserted_ok=ok,
                 )
 
                 rows_summary.append({
-                    "name":           candidate_name or "(unknown)",
-                    "outcome":        "conflict",
-                    "record_data":    new_record_data,
-                    "updated_fields": [],
-                    "missing":        [],
-                    "dup_flag":       "",
-                    "db_error":       None,
-                    "conflict_id":    conflict_id,
-                    "existing_recruiter": diff_key.get("recruiter"),
+                    "name":              candidate_name or "(unknown)",
+                    "outcome":           "inserted" if ok else "error",
+                    "record_data":       new_record_data,
+                    "updated_fields":    [],
+                    "missing":           [f for f in _REQUIRED_FIELDS if not new_record_data.get(f)],
+                    "dup_flag":          "Duplicate Recruiter",
+                    "db_error":          None if ok else "DB insert failed — check extractor.log",
+                    "diff_recruiter":    diff_key.get("recruiter"),
                 })
                 continue
 
+            # ── TIER 2.5: Same contact/email, different JR or recruiter — flag only ─
+            contact_dup = find_contact_email_only_duplicate(
+                cur,
+                contact_number or "",
+                email_id_val   or "",
+            )
+            contact_dup_flag = "Duplicate Contact" if contact_dup is not None else ""
+
             # ── TIER 3: No matching record — standard insert path ────────────
             dup_flag = check_duplicate(cur, contact_number or "", email_id_val or "")
+            # Merge contact-only duplicate flag if no stronger flag already set
+            if not dup_flag and contact_dup_flag:
+                dup_flag = contact_dup_flag
 
             record_data = {
                 "recruiter":           _t(recruiter),
@@ -1118,6 +1280,24 @@ def process_emails() -> None:
                     f"  ✓ {candidate_name or '(unknown)'} | "
                     f"recruiter={recruiter} | dup={dup_flag or 'none'}"
                 )
+                # Notify manager + both recruiters when contact-only duplicate detected
+                if dup_flag == "Duplicate Contact" and contact_dup is not None:
+                    send_diff_recruiter_notification_email(
+                        token=token,
+                        new_recruiter_addr=from_addr,
+                        existing_recruiter_addr=(
+                            contact_dup.get("recruiter", "") + "@" + VOLIBITS_DOMAIN
+                        ),
+                        existing_row=contact_dup,
+                        new_record_data=record_data,
+                        original_subject=subject,
+                        jr_no=effective_jr_no or general_skill or "",
+                        inserted_ok=ok,
+                    )
+                    log.info(
+                        f"  ✉ [DUP-CONTACT] Notified manager for {candidate_name} — "
+                        f"existing recruiter: {contact_dup.get('recruiter')}"
+                    )
                 rows_summary.append({
                     "name":           candidate_name or "(unknown)",
                     "outcome":        "inserted",
@@ -1140,6 +1320,26 @@ def process_emails() -> None:
                     "db_error":       "DB insert failed — check extractor.log",
                 })
 
+        # Determine overall outcome label for the audit log
+        if email_errors > 0 and email_inserted == 0 and email_updated == 0:
+            _outcome = "all_failed"
+        elif email_errors > 0:
+            _outcome = "partial"
+        else:
+            _outcome = "ok"
+
+        # Record the message_id in the same transaction so it commits atomically
+        mark_email_processed(
+            cur,
+            message_id=message_id,
+            subject=subject,
+            from_addr=from_addr,
+            outcome=_outcome,
+            rows_inserted=email_inserted,
+            rows_updated=email_updated,
+            rows_errors=email_errors,
+        )
+
         try:
             conn.commit()
         except Exception as e:
@@ -1158,7 +1358,7 @@ def process_emails() -> None:
             email_conflicts=email_conflicts,
         )
 
-        mark_email_read(token, msg["id"])
+        mark_email_read(token, message_id)
         processed += 1
 
     cur.close()
