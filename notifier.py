@@ -8,12 +8,10 @@ processed email. The notification shows:
   • Green  ✓  for fields that were successfully extracted
   • Red    ✗  for fields that are missing / failed
   • "Updated" section for rows where empty fields were filled in existing record
-  • "Conflict" section for rows pending recruiter decision
   • A top-level summary banner (All Passed / Partial / All Failed)
 
-Also sends a separate HIGH-IMPORTANCE conflict notification email when the same
-candidate is found under a different recruiter, with mailto action links so the
-recipient can reply with UPDATE / NEW / SKIP without needing a web form.
+Also sends an informational FYI email when the same candidate is found under
+a different recruiter, notifying both recruiters of the duplicate submission.
 
 CC recipients (team lead + manager) are loaded from the NOTIFY_CC_EMAILS secret.
 Mail is sent via the mail-reading app (AZURE_* creds) which has Mail.Send.
@@ -520,119 +518,6 @@ def send_notification_email(
 
     _send_graph_mail(token, payload, from_addr)
 
-
-# ─── Conflict notification (high importance) ────────────────────────────────────
-def build_conflict_email_html(
-    conflict_id: str,
-    existing_row: dict,
-    new_record_data: dict,
-    new_recruiter_addr: str,
-    existing_recruiter_addr: str,
-    original_subject: str,
-) -> tuple[str, str]:
-    """
-    Returns (subject_line, html_body) for the conflict notification.
-
-    The email contains:
-    - Side-by-side comparison of existing vs new record
-    - Three mailto action links → recruiter just clicks one and hits Send
-      Subject format the extractor listens for: [HR-ACTION] UPDATE|NEW|SKIP <conflict_id>
-    """
-    candidate_name = (
-        _val(new_record_data.get("name_of_candidate"))
-        or _val(existing_row.get("name_of_candidate"))
-        or "Unknown Candidate"
-    )
-    existing_recruiter = existing_row.get("recruiter", "—")
-    new_recruiter      = new_record_data.get("recruiter", "—")
-    now_str            = datetime.now().strftime("%d %b %Y, %I:%M %p")
-
-    subject_line = (
-        f"[HR Bot] 🚨 ACTION REQUIRED — Candidate Conflict: "
-        f"{candidate_name} | {original_subject}"
-    )
-
-    # Build mailto hrefs — recruiter clicks, email client opens with pre-filled subject
-    mailbox = TARGET_MAILBOX
-    action_update = f"mailto:{mailbox}?subject=[HR-ACTION] UPDATE {conflict_id}"
-    action_new    = f"mailto:{mailbox}?subject=[HR-ACTION] NEW {conflict_id}"
-    action_skip   = f"mailto:{mailbox}?subject=[HR-ACTION] SKIP {conflict_id}"
-
-    comparison_html = _comparison_table_html(existing_row, new_record_data)
-
-    html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><style>{_CSS}</style></head>
-<body><div class="wrap">
-
-  <div class="hdr conflict">
-    <h1>🚨 Candidate Conflict — Action Required</h1>
-    <p>Subject: <strong>{original_subject}</strong> &nbsp;|&nbsp;
-       Detected at: {now_str}</p>
-  </div>
-
-  <div class="body">
-
-    <div class="urgent-banner">
-      ⚠️ <strong>The candidate below has been submitted by two different recruiters
-      for the same date/role.</strong><br>
-      New submission by <strong>{new_recruiter}</strong> conflicts with an existing
-      record added by <strong>{existing_recruiter}</strong>.<br>
-      <small style="opacity:.8">Conflict ID: {conflict_id}</small>
-    </div>
-
-    <h3 style="margin:0 0 12px;color:#4a148c">📋 Field Comparison</h3>
-    <p style="font-size:12px;color:#888;margin:0 0 10px">
-      🟡 Highlighted rows have different values between the two submissions.
-    </p>
-    {comparison_html}
-
-    <h3 style="margin:24px 0 8px;color:#333">📬 Choose an Action</h3>
-    <p style="font-size:13px;color:#555;margin:0 0 16px">
-      Click one of the buttons below. Your email client will open with a
-      pre-filled subject — just hit <strong>Send</strong>.
-      The bot will process your choice on its next run.
-    </p>
-
-    <div class="actions">
-      <a href="{action_update}" class="btn btn-update">
-        ✏️ Update Existing Record<br>
-        <small style="font-weight:400;font-size:11px">
-          Fill empty fields in {existing_recruiter}'s record
-        </small>
-      </a>
-      <a href="{action_new}" class="btn btn-new">
-        ➕ Add as New Record<br>
-        <small style="font-weight:400;font-size:11px">
-          Insert {new_recruiter}'s submission separately
-        </small>
-      </a>
-      <a href="{action_skip}" class="btn btn-skip">
-        ⏭ Skip / Ignore<br>
-        <small style="font-weight:400;font-size:11px">
-          Discard the new submission
-        </small>
-      </a>
-    </div>
-
-    <p style="font-size:12px;color:#888;margin:16px 0 0">
-      <strong>Note:</strong> "Update Existing Record" will only fill fields that are
-      currently empty — it will never overwrite data that already exists.
-    </p>
-
-  </div>
-
-  <div class="footer">
-    This is an automated urgent notification from {TARGET_MAILBOX}.<br>
-    Reply by clicking one of the action buttons above — do not reply manually.<br>
-    Conflict ID: {conflict_id}
-  </div>
-
-</div></body></html>"""
-
-    return subject_line, html
-
-
-
 def send_diff_recruiter_notification_email(
     token: str,
     new_recruiter_addr: str,
@@ -737,50 +622,6 @@ def send_diff_recruiter_notification_email(
     }
 
     _send_graph_mail(token, payload, new_recruiter_addr, label="diff-recruiter notification")
-
-
-def send_conflict_notification_email(
-    token: str,
-    new_recruiter_addr: str,
-    existing_recruiter_addr: str,
-    conflict_id: str,
-    existing_row: dict,
-    new_record_data: dict,
-    original_subject: str,
-) -> None:
-    """
-    Send a HIGH-IMPORTANCE conflict notification to both recruiters.
-    The new recruiter is To:; the existing recruiter is CC:.
-    CC list (team lead / manager) is also included.
-    """
-    subject_line, html_body = build_conflict_email_html(
-        conflict_id, existing_row, new_record_data,
-        new_recruiter_addr, existing_recruiter_addr,
-        original_subject,
-    )
-
-    # CC: existing recruiter + standard CC list
-    cc_list = []
-    if existing_recruiter_addr and existing_recruiter_addr != new_recruiter_addr:
-        cc_list.append({"emailAddress": {"address": existing_recruiter_addr}})
-    for addr in NOTIFY_CC_EMAILS.split(","):
-        addr = addr.strip()
-        if addr:
-            cc_list.append({"emailAddress": {"address": addr}})
-
-    payload = {
-        "message": {
-            "subject":      subject_line,
-            "importance":   "high",              # ← marks email as Important/Urgent in Outlook
-            "flag":         {"flagStatus": "flagged"},  # ← also flags it in the inbox
-            "body":         {"contentType": "HTML", "content": html_body},
-            "toRecipients": [{"emailAddress": {"address": new_recruiter_addr}}],
-            "ccRecipients": cc_list,
-        },
-        "saveToSentItems": "false",
-    }
-
-    _send_graph_mail(token, payload, new_recruiter_addr, label="conflict notification")
 
 
 # ─── Shared Graph send helper ────────────────────────────────────────────────────
