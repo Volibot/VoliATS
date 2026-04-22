@@ -277,7 +277,9 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
     )
     resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
-    return resp.json().get("value", [])
+    emails = resp.json().get("value", [])
+    log.info(f"Fetched {len(emails)} email(s) (all emails, including read).")
+    return emails
 
 
 def mark_email_read(token: str, message_id: str) -> None:
@@ -880,7 +882,6 @@ def process_emails() -> None:
     conn.commit()
 
     emails = fetch_emails(token, folder_id=inbox_folder_id)
-    log.info(f"Fetched {len(emails)} unread email(s).")
 
     processed = skipped = inserted = updated = conflicts = errors = 0
 
