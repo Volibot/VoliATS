@@ -270,6 +270,7 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
     url = (
         f"{base}"
         f"?$top={top}"
+        f"&$filter=(isRead eq false or isRead eq true)"
         f"&$select=id,subject,from,toRecipients,ccRecipients,"
         f"body,receivedDateTime,isRead,hasAttachments"
         f"&$expand=attachments($select=id,name,contentType,size)"
