@@ -5,13 +5,11 @@ Reads emails via Microsoft Graph API and inserts candidate data into PostgreSQL.
 recruiter        = local part of sender email   — sender is always @volibits.com
 client_recruiter = local part of receiver email — can be any domain
 
-Duplicate handling (three-tier):
+Duplicate handling:
   1. Same recruiter + same key fields → auto-fill only NULL/empty fields in the
      existing record; never overwrite populated values.
-  2. Different recruiter + same candidate/JR → store conflict in
-     hr_pending_conflicts, send urgent notification with mailto action links.
-  3. [HR-ACTION] reply emails → processed at the start of each run to resolve
-     pending conflicts (UPDATE / NEW / SKIP).
+  2. Different recruiter + same candidate/JR → insert record immediately and
+     send informational notification to both recruiters.
 
 OneDrive fix notes:
   - Only .pdf / .doc / .docx attachments are uploaded
@@ -21,7 +19,6 @@ OneDrive fix notes:
 import os
 import re
 import json
-import uuid
 import logging
 import requests
 import psycopg2
@@ -31,7 +28,6 @@ from typing import Optional
 from msal import ConfidentialClientApplication
 from notifier import (
     send_notification_email,
-    send_conflict_notification_email,
     send_diff_recruiter_notification_email,
 )
 
@@ -83,10 +79,6 @@ UPDATABLE_FIELDS = [
     "attachment", "remarks",
 ]
 
-# Subject prefix that marks a recruiter's action-reply email
-ACTION_REPLY_RE = re.compile(
-    r"^\[HR-ACTION\]\s+(UPDATE|NEW|SKIP)\s+([\w-]+)\s*$", re.IGNORECASE
-)
 
 
 # ─── Company code → full name ────────────────────────────────────────────────────
@@ -281,7 +273,6 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
         f"&$select=id,subject,from,toRecipients,ccRecipients,"
         f"body,receivedDateTime,isRead,hasAttachments"
         f"&$expand=attachments($select=id,name,contentType,size)"
-        f"&$filter=isRead eq false"
         f"&$orderby=receivedDateTime asc"
     )
     resp = requests.get(url, headers=headers, timeout=30)
@@ -461,23 +452,6 @@ def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
 # ─── DB schema helpers ────────────────────────────────────────────────────────────
 def ensure_tables(cur) -> None:
     """Create ancillary tables if they don't exist yet."""
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS hr_pending_conflicts (
-            conflict_id         TEXT PRIMARY KEY,
-            created_at          TIMESTAMP DEFAULT NOW(),
-            status              TEXT DEFAULT 'pending',
-            action_taken        TEXT,
-            resolved_at         TIMESTAMP,
-            existing_record_id  INTEGER,
-            existing_recruiter  TEXT,
-            existing_email_from TEXT,
-            new_recruiter       TEXT,
-            candidate_name      TEXT,
-            contact_number      TEXT,
-            email_id_val        TEXT,
-            new_record_data     TEXT
-        )
-    """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS hr_processed_emails (
             message_id    TEXT PRIMARY KEY,
@@ -709,157 +683,6 @@ def apply_field_updates(cur, record_id: int, updates: dict) -> None:
     cur.execute(query, list(updates.values()) + [record_id])
 
 
-def store_pending_conflict(
-    cur,
-    conflict_id: str,
-    existing_row: dict,
-    new_record_data: dict,
-) -> None:
-    cur.execute(
-        """
-        INSERT INTO hr_pending_conflicts
-            (conflict_id, existing_record_id, existing_recruiter, existing_email_from,
-             new_recruiter, candidate_name, contact_number, email_id_val, new_record_data)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (conflict_id) DO NOTHING
-        """,
-        (
-            conflict_id,
-            existing_row.get("id"),
-            existing_row.get("recruiter"),
-            existing_row.get("email_from"),
-            new_record_data.get("recruiter"),
-            new_record_data.get("name_of_candidate"),
-            new_record_data.get("contact_number"),
-            new_record_data.get("email_id"),
-            json.dumps(new_record_data, default=str),
-        ),
-    )
-
-
-# ─── Action-reply processor ───────────────────────────────────────────────────────
-def _restore_record_dates(data: dict) -> dict:
-    """Parse date strings back to Python objects after JSON round-trip."""
-    for key in ("date",):
-        val = data.get(key)
-        if isinstance(val, str):
-            parsed = _parse_date(val)
-            data[key] = parsed
-    for key in ("created_date", "modified_date"):
-        val = data.get(key)
-        if isinstance(val, str):
-            try:
-                data[key] = datetime.fromisoformat(val)
-            except ValueError:
-                data[key] = datetime.now()
-    return data
-
-
-def process_action_replies(token: str, cur, conn) -> None:
-    """
-    Scan inbox for [HR-ACTION] reply emails (oldest first) and resolve the
-    matching pending conflict record before normal email processing begins.
-    """
-    headers = {"Authorization": f"Bearer {token}"}
-    url = (
-        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages"
-        f"?$top=50"
-        f"&$select=id,subject,from,receivedDateTime"
-        f"&$filter=isRead eq false"
-        f"&$orderby=receivedDateTime asc"
-    )
-    resp = requests.get(url, headers=headers, timeout=30)
-    if not resp.ok:
-        log.warning(f"process_action_replies: fetch failed {resp.status_code}")
-        return
-
-    for msg in resp.json().get("value", []):
-        subject    = (msg.get("subject") or "").strip()
-        message_id = msg["id"]
-        m          = ACTION_REPLY_RE.match(subject)
-        if not m:
-            continue   # Not an action reply — leave for normal processing
-
-        # Skip if this action-reply email was already processed
-        if is_email_processed(cur, message_id):
-            log.info(f"Action reply already processed — skipping {message_id}")
-            mark_email_read(token, message_id)
-            continue
-
-        action      = m.group(1).upper()
-        conflict_id = m.group(2)
-        sender      = _extract_address(msg.get("from", {}))
-        log.info(f"Action reply: {action} | id={conflict_id} | from={sender}")
-
-        cur.execute(
-            "SELECT existing_record_id, new_record_data "
-            "FROM hr_pending_conflicts "
-            "WHERE conflict_id = %s AND status = 'pending'",
-            (conflict_id,),
-        )
-        conflict = cur.fetchone()
-        if not conflict:
-            log.warning(f"No pending conflict for id={conflict_id} — may be already resolved")
-            mark_email_read(token, msg["id"])
-            continue
-
-        existing_id, new_record_json = conflict
-        new_record_data = _restore_record_dates(json.loads(new_record_json))
-
-        try:
-            if action == "UPDATE":
-                cols = _select_cols_for_update()
-                q = pgsql.SQL("SELECT {cols} FROM {tbl} WHERE id = %s").format(
-                    cols=pgsql.SQL(", ").join(pgsql.Identifier(c) for c in cols),
-                    tbl=pgsql.Identifier(DB_TABLE),
-                )
-                cur.execute(q, (existing_id,))
-                row = cur.fetchone()
-                if row:
-                    existing_row = dict(zip(cols, row))
-                    updates      = compute_updates(existing_row, new_record_data)
-                    if updates:
-                        apply_field_updates(cur, existing_id, updates)
-                        log.info(
-                            f"  ✓ [ACTION:UPDATE] record {existing_id} "
-                            f"— filled: {list(updates.keys())}"
-                        )
-                    else:
-                        log.info(f"  ↷ [ACTION:UPDATE] no empty fields to fill in record {existing_id}")
-                else:
-                    log.warning(f"  [ACTION:UPDATE] record {existing_id} not found in DB")
-
-            elif action == "NEW":
-                new_record_data["created_date"]  = datetime.now()
-                new_record_data["modified_date"] = datetime.now()
-                insert_record(cur, new_record_data)
-                log.info(f"  ✓ [ACTION:NEW] inserted new record for conflict {conflict_id}")
-
-            else:  # SKIP
-                log.info(f"  ↷ [ACTION:SKIP] conflict {conflict_id} skipped by {sender}")
-
-            cur.execute(
-                "UPDATE hr_pending_conflicts "
-                "SET status='resolved', action_taken=%s, resolved_at=NOW() "
-                "WHERE conflict_id=%s",
-                (action, conflict_id),
-            )
-            mark_email_processed(
-                cur,
-                message_id=message_id,
-                subject=subject,
-                from_addr=sender,
-                outcome=f"action_{action.lower()}",
-            )
-            conn.commit()
-
-        except Exception as exc:
-            log.error(f"Action reply processing failed for {conflict_id}: {exc}")
-            conn.rollback()
-
-        mark_email_read(token, message_id)
-
-
 # ─── Standard duplicate flag (for is_duplicate column) ──────────────────────────
 def check_duplicate(cur, contact_number: str, email_id: str) -> str:
     """Returns 'Duplicate', 'Duplicate Cell', 'Duplicate Email', or ''.
@@ -1056,9 +879,6 @@ def process_emails() -> None:
     ensure_tables(cur)
     conn.commit()
 
-    # ── Resolve any pending conflict action-replies first ────────────────────
-    process_action_replies(token, cur, conn)
-
     emails = fetch_emails(token, folder_id=inbox_folder_id)
     log.info(f"Fetched {len(emails)} unread email(s).")
 
@@ -1071,11 +891,6 @@ def process_emails() -> None:
         # Skip emails already committed to hr_processed_emails
         if is_email_processed(cur, message_id):
             log.info(f"Already processed — skipping {message_id} | {subject!r}")
-            mark_email_read(token, message_id)
-            continue
-
-        # Skip [HR-ACTION] emails — already handled above
-        if ACTION_REPLY_RE.match(subject):
             mark_email_read(token, message_id)
             continue
 
