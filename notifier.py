@@ -482,6 +482,7 @@ def build_email_html(
 
     return subject_line, html
 
+ENABLE_NOTIFICATIONS = os.environ.get("ENABLE_NOTIFICATIONS", "true").strip().lower() == "true"
 
 def send_notification_email(
     token: str,
