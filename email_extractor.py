@@ -55,7 +55,7 @@ OD_CLIENT_SECRET    = os.environ["OD_CLIENT_SECRET"]
 TARGET_MAILBOX      = os.environ["TARGET_MAILBOX"]
 DB_DSN              = os.environ["DB_DSN"]
 DB_TABLE            = os.environ.get("DB_TABLE_NAME", "hrvolibit")
-ONEDRIVE_FOLDER     = os.environ.get("ONEDRIVE_FOLDER", "HR Resumes")
+ONEDRIVE_FOLDER     = os.environ.get("ONEDRIVE_FOLDER", "HrVolibotAttachmentTest")
 
 # Subfolder inside the target mailbox to read candidate emails from.
 # Set to empty string "" to read from the root inbox instead.
