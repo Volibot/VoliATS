@@ -273,7 +273,7 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
         f"&$select=id,subject,from,toRecipients,ccRecipients,"
         f"body,receivedDateTime,isRead,hasAttachments"
         f"&$expand=attachments($select=id,name,contentType,size)"
-        f"&$orderby=receivedDateTime asc"
+        f"&$orderby=receivedDateTime desc"
     )
     resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
