@@ -124,7 +124,7 @@ CONFLICT_COMPARE_FIELDS = [
 _CSS = """
   body { font-family:'Segoe UI',Arial,sans-serif; font-size:14px;
          color:#1a1a2e; background:#f4f6f9; margin:0; padding:0; }
-  .wrap  { max-width:800px; margin:24px auto; background:#fff;
+  .wrap  { max-width:800px; margin:24px auto; background:#ffffff;
            border-radius:8px; overflow:hidden;
            box-shadow:0 2px 12px rgba(0,0,0,.10); }
   .hdr   { padding:24px 32px; }
@@ -132,9 +132,8 @@ _CSS = """
   .hdr.fail    { background:#b71c1c; }
   .hdr.partial { background:#e65100; }
   .hdr.conflict{ background:#6a1b9a; }
-  .hdr h1 { margin:0; font-size:20px; color:#fff; }
-  .hdr p  { margin:4px 0 0; color:rgba(255,255,255,.85); font-size:13px; }
-  .body  { padding:24px 32px; }
+  .hdr h1 { margin:0; font-size:20px; color:#ffffff; font-family:'Segoe UI',Arial,sans-serif; }
+  .body  { padding:24px 32px; background:#ffffff; color:#1a1a2e; }
   .summary-bar { display:flex; gap:12px; margin-bottom:24px; flex-wrap:wrap; }
   .stat  { flex:1; min-width:110px; padding:14px 18px; border-radius:6px;
            text-align:center; }
@@ -144,7 +143,7 @@ _CSS = """
   .stat.upd    { background:#e3f2fd; border:1px solid #90caf9; }
   .stat.conf   { background:#f3e5f5; border:1px solid #ce93d8; }
   .stat .num { font-size:26px; font-weight:700; display:block; }
-  .stat .lbl { font-size:12px; color:#555; }
+  .stat .lbl { font-size:12px; color:#555555; }
   .stat.ins  .num { color:#2e7d32; }
   .stat.skip .num { color:#f57f17; }
   .stat.err  .num { color:#c62828; }
@@ -157,24 +156,25 @@ _CSS = """
   .card-hdr.pass    { background:#e8f5e9; color:#1b5e20; border-bottom:1px solid #c8e6c9; }
   .card-hdr.fail    { background:#ffebee; color:#7f0000; border-bottom:1px solid #ffcdd2; }
   .card-hdr.partial { background:#fff3e0; color:#bf360c; border-bottom:1px solid #ffe0b2; }
-  .card-hdr.skip    { background:#f3f4f6; color:#555;    border-bottom:1px solid #e0e0e0; }
+  .card-hdr.skip    { background:#f3f4f6; color:#555555; border-bottom:1px solid #e0e0e0; }
   .card-hdr.upd     { background:#e3f2fd; color:#0d47a1; border-bottom:1px solid #bbdefb; }
   .card-hdr.nochange{ background:#f5f5f5; color:#757575; border-bottom:1px solid #e0e0e0; }
   .card-hdr.conflict{ background:#f3e5f5; color:#4a148c; border-bottom:1px solid #e1bee7; }
   .badge { padding:2px 10px; border-radius:12px; font-size:12px; font-weight:700;
            margin-left:auto; }
-  .badge.pass     { background:#2e7d32; color:#fff; }
-  .badge.fail     { background:#c62828; color:#fff; }
-  .badge.partial  { background:#e65100; color:#fff; }
-  .badge.skip     { background:#78909c; color:#fff; }
-  .badge.upd      { background:#1565c0; color:#fff; }
-  .badge.nochange { background:#9e9e9e; color:#fff; }
-  .badge.conflict { background:#6a1b9a; color:#fff; }
-  .fields { padding:14px 18px; }
+  .badge.pass     { background:#2e7d32; color:#ffffff; }
+  .badge.fail     { background:#c62828; color:#ffffff; }
+  .badge.partial  { background:#e65100; color:#ffffff; }
+  .badge.skip     { background:#78909c; color:#ffffff; }
+  .badge.upd      { background:#1565c0; color:#ffffff; }
+  .badge.nochange { background:#9e9e9e; color:#ffffff; }
+  .badge.conflict { background:#6a1b9a; color:#ffffff; }
+  .fields { padding:14px 18px; background:#ffffff; color:#1a1a2e; }
   table.ft { width:100%; border-collapse:collapse; }
   table.ft td { padding:6px 10px; vertical-align:top;
-                border-bottom:1px solid #f0f0f0; font-size:13px; }
-  table.ft td:first-child { width:38%; color:#555; font-weight:500; }
+                border-bottom:1px solid #f0f0f0; font-size:13px;
+                color:#1a1a2e; font-family:'Segoe UI',Arial,sans-serif; }
+  table.ft td:first-child { width:38%; color:#555555; font-weight:500; }
   .val-ok   { color:#1b5e20; }
   .val-miss { color:#c62828; font-style:italic; }
   .val-upd  { color:#1565c0; font-weight:600; }
@@ -189,9 +189,9 @@ _CSS = """
   table.cmp th { padding:8px 12px; background:#f3e5f5; color:#4a148c;
                  text-align:left; font-weight:600; border-bottom:2px solid #ce93d8; }
   table.cmp td { padding:7px 12px; border-bottom:1px solid #f0f0f0;
-                 vertical-align:top; }
+                 vertical-align:top; color:#1a1a2e; }
   table.cmp tr:nth-child(even) td { background:#fafafa; }
-  .cmp-empty { color:#bbb; font-style:italic; }
+  .cmp-empty { color:#bbbbbb; font-style:italic; }
   .cmp-diff  { background:#fff9c4 !important; }
   /* Action buttons */
   .actions { display:flex; gap:12px; margin:20px 0 8px; flex-wrap:wrap; }
@@ -465,16 +465,16 @@ def build_email_html(
 <html><head><meta charset="utf-8"><style>{_CSS}</style></head>
 <body><div class="wrap">
   <div class="hdr {hdr_cls}">
-    <h1>{hdr_icon} HR Bot Processing Report</h1>
-    <p>Subject: <strong>{original_subject}</strong> &nbsp;|&nbsp;
-       Submitted by: <strong>{from_addr}</strong> &nbsp;|&nbsp;
-       Processed at: {now_str}</p>
+    <h1 style="margin:0;font-size:20px;color:#ffffff;font-family:'Segoe UI',Arial,sans-serif">{hdr_icon} HR Bot Processing Report</h1>
+    <p style="margin:6px 0 0;color:#ffffff;font-size:13px;font-family:'Segoe UI',Arial,sans-serif">
+      Submitted by: <strong>{from_addr}</strong> &nbsp;|&nbsp; Processed at: {now_str}
+    </p>
   </div>
-  <div class="body">
+  <div class="body" style="padding:24px 32px;background:#ffffff;color:#1a1a2e;font-family:'Segoe UI',Arial,sans-serif">
     <div class="summary-bar">{stats_html}</div>
     {cards_html}
   </div>
-  <div class="footer">
+  <div class="footer" style="padding:16px 32px;background:#f8f9fa;font-size:11px;color:#9e9e9e;border-top:1px solid #e0e0e0">
     This is an automated message from {TARGET_MAILBOX} — please do not reply directly.<br>
     For issues, contact your system administrator or check extractor.log.
   </div>
@@ -561,12 +561,11 @@ def send_diff_recruiter_notification_email(
 <body><div class="wrap">
 
   <div class="hdr" style="background:#1565c0">
-    <h1>FYI: Candidate Submitted by Multiple Recruiters</h1>
-    <p>Subject: <strong>{original_subject}</strong> &nbsp;|&nbsp;
-       Detected at: {now_str}</p>
+    <h1 style="margin:0;font-size:20px;color:#ffffff;font-family:'Segoe UI',Arial,sans-serif">FYI: Candidate Submitted by Multiple Recruiters</h1>
+    <p style="margin:6px 0 0;color:#ffffff;font-size:13px;font-family:'Segoe UI',Arial,sans-serif">Detected at: {now_str}</p>
   </div>
 
-  <div class="body">
+  <div class="body" style="padding:24px 32px;background:#ffffff;color:#1a1a2e;font-family:'Segoe UI',Arial,sans-serif">
 
     <div style="background:#e3f2fd;border:1px solid #90caf9;border-radius:6px;
                 padding:14px 20px;margin-bottom:20px;font-size:14px;color:#0d47a1">
@@ -579,15 +578,15 @@ def send_diff_recruiter_notification_email(
       {status_line}
     </div>
 
-    <h3 style="margin:0 0 12px;color:#1565c0">Field Comparison</h3>
-    <p style="font-size:12px;color:#888;margin:0 0 10px">
+    <h3 style="margin:0 0 12px;color:#1565c0;font-family:'Segoe UI',Arial,sans-serif">Field Comparison</h3>
+    <p style="font-size:12px;color:#888888;margin:0 0 10px;font-family:'Segoe UI',Arial,sans-serif">
       Highlighted rows have different values between the two submissions.
     </p>
     {comparison_html}
 
   </div>
 
-  <div class="footer">
+  <div class="footer" style="padding:16px 32px;background:#f8f9fa;font-size:11px;color:#9e9e9e;border-top:1px solid #e0e0e0">
     This is an automated informational message from {TARGET_MAILBOX}.<br>
     No action is required — the record has been added automatically.
   </div>
