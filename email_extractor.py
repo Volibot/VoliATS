@@ -270,7 +270,6 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
     url = (
         f"{base}"
         f"?$top={top}"
-        f"&$filter=(isRead eq false or isRead eq true)"
         f"&$select=id,subject,from,toRecipients,ccRecipients,"
         f"body,receivedDateTime,isRead,hasAttachments"
         f"&$expand=attachments($select=id,name,contentType,size)"
@@ -279,7 +278,7 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
     resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
     emails = resp.json().get("value", [])
-    log.info(f"Fetched {len(emails)} email(s) (all emails, including read).")
+    log.info(f"Fetched {len(emails)} email(s).")
     return emails
 
 
@@ -882,7 +881,7 @@ def process_emails() -> None:
     ensure_tables(cur)
     conn.commit()
 
-    emails = fetch_emails(token, folder_id=inbox_folder_id)
+    emails = fetch_emails(token, top=200, folder_id=inbox_folder_id)
 
     processed = skipped = inserted = updated = conflicts = errors = 0
 
