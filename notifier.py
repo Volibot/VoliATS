@@ -537,10 +537,10 @@ def send_diff_recruiter_notification_email(
     by a different recruiter.  The new record is already inserted — no action
     is needed from either recruiter.  Both recruiters are notified.
     """
-  if not ENABLE_NOTIFICATIONS:
+    if not ENABLE_NOTIFICATIONS:
         log.info("Notifications disabled (ENABLE_NOTIFICATIONS=false) — skipping.")
         return
-    candidate_name = (
+        candidate_name = (
         _val(new_record_data.get("name_of_candidate"))
         or _val(existing_row.get("name_of_candidate"))
         or "Unknown Candidate"
@@ -637,7 +637,7 @@ def _send_graph_mail(
     primary_recipient: str,
     label: str = "notification",
 ) -> None:
-  if not ENABLE_NOTIFICATIONS:
+    if not ENABLE_NOTIFICATIONS:
         log.info("Notifications disabled (ENABLE_NOTIFICATIONS=false) — skipping.")
         return
     url  = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/sendMail"
