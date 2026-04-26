@@ -1,4 +1,4 @@
-name: HR Email Extractor
+name: HR Email Extractor Archive
 on:
   schedule:
     - cron: "*/5 * * * *"
