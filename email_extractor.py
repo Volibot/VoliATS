@@ -11,11 +11,18 @@ Duplicate handling:
   2. Different recruiter + same candidate/JR → insert record immediately and
      send informational notification to both recruiters.
 
-OneDrive fix notes:
-  - Only .pdf / .doc / .docx attachments are uploaded
+OneDrive auth:
+  - Uses a DELEGATED refresh token (OD_REFRESH_TOKEN) obtained once via
+    generate_refresh_token.py and stored as a GitHub Secret.
+  - This avoids requiring Files.ReadWrite.All (application permission).
+  - The token is scoped to ONEDRIVE_USER's personal OneDrive only.
+  - Refresh tokens expire after 90 days — re-run generate_refresh_token.py
+    before they expire to obtain a new one.
+
+OneDrive notes:
+  - Only .pdf / .doc / .docx attachments are uploaded.
   - Drive uploads use ONEDRIVE_USER (your personal email) instead of
     TARGET_MAILBOX, since the OD app has access to your personal OneDrive.
-  - Requires Files.ReadWrite (Application) permission on the OD app in Azure.
 """
 
 import os
@@ -27,13 +34,13 @@ import psycopg2
 from psycopg2 import sql as pgsql
 from datetime import datetime, date
 from typing import Optional
-from msal import ConfidentialClientApplication
+from msal import ConfidentialClientApplication, PublicClientApplication
 from notifier import (
     send_notification_email,
     send_diff_recruiter_notification_email,
 )
 
-# ─── Logging ─────────────────────────────────────────────────────────────────────
+# ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -45,20 +52,21 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ─── Configuration ────────────────────────────────────────────────────────────────
+# ─── Configuration ─────────────────────────────────────────────────────────────
 AZURE_TENANT_ID     = os.environ["AZURE_TENANT_ID"]
 AZURE_CLIENT_ID     = os.environ["AZURE_CLIENT_ID"]
 AZURE_CLIENT_SECRET = os.environ["AZURE_CLIENT_SECRET"]
 
 OD_TENANT_ID        = os.environ["OD_TENANT_ID"]
 OD_CLIENT_ID        = os.environ["OD_CLIENT_ID"]
-OD_CLIENT_SECRET    = os.environ["OD_CLIENT_SECRET"]
+# OD_CLIENT_SECRET is no longer used for OneDrive auth (delegated flow instead)
+# Keep it in your env if other parts of your system reference it.
+OD_CLIENT_SECRET    = os.environ.get("OD_CLIENT_SECRET", "")
+
+# Refresh token obtained via generate_refresh_token.py — store as GitHub Secret.
+OD_REFRESH_TOKEN    = os.environ["OD_REFRESH_TOKEN"]
 
 TARGET_MAILBOX      = os.environ["TARGET_MAILBOX"]
-
-# Your personal email whose OneDrive the OD app has access to.
-# This is where resume attachments will be uploaded.
-# Add this to your .env: ONEDRIVE_USER=yourname@volibits.com
 ONEDRIVE_USER       = os.environ["ONEDRIVE_USER"]
 
 DB_DSN              = os.environ["DB_DSN"]
@@ -86,7 +94,7 @@ UPDATABLE_FIELDS = [
 ]
 
 
-# ─── Company code → full name ─────────────────────────────────────────────────────
+# ─── Company code → full name ──────────────────────────────────────────────────
 COMPANY_CODES: dict[str, str] = {
     "BS":  "Birlasoft",
     "BW":  "BeWealthy",
@@ -105,7 +113,7 @@ COMPANY_CODES: dict[str, str] = {
 }
 
 
-# ─── Fuzzy column-header aliases ──────────────────────────────────────────────────
+# ─── Fuzzy column-header aliases ───────────────────────────────────────────────
 COLUMN_ALIASES: dict[str, list[str]] = {
     "jr_no": [
         "jr no", "jr_no", "jr no.", "jr", "jrno", "req_id", "req id",
@@ -171,7 +179,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
 }
 
 
-# ─── Build alias lookup once at startup ───────────────────────────────────────────
+# ─── Build alias lookup once at startup ────────────────────────────────────────
 def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
@@ -187,8 +195,9 @@ def _resolve_header(raw_header: str) -> Optional[str]:
     return ALIAS_MAP.get(_normalize(raw_header))
 
 
-# ─── Microsoft Graph authentication ───────────────────────────────────────────────
-def _get_token(tenant_id: str, client_id: str, client_secret: str) -> str:
+# ─── Microsoft Graph authentication ────────────────────────────────────────────
+def _get_app_token(tenant_id: str, client_id: str, client_secret: str) -> str:
+    """Client-credentials (app-only) token — used for mail reading."""
     result = ConfidentialClientApplication(
         client_id,
         authority=f"https://login.microsoftonline.com/{tenant_id}",
@@ -196,20 +205,49 @@ def _get_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     ).acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
     if "access_token" not in result:
         raise RuntimeError(
-            f"Token acquisition failed: {result.get('error_description')}"
+            f"App token acquisition failed: {result.get('error_description')}"
         )
     return result["access_token"]
 
 
 def get_mail_token() -> str:
-    return _get_token(AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET)
+    """App-only token for reading TARGET_MAILBOX via Mail.Read application permission."""
+    return _get_app_token(AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET)
 
 
 def get_onedrive_token() -> str:
-    return _get_token(OD_TENANT_ID, OD_CLIENT_ID, OD_CLIENT_SECRET)
+    """
+    Delegated token for ONEDRIVE_USER's personal OneDrive.
+
+    Uses a stored refresh token (OD_REFRESH_TOKEN) so no interactive login
+    is needed at runtime.  The PublicClientApplication.acquire_token_by_refresh_token
+    call exchanges the refresh token for a fresh access token each run.
+
+    The refresh token itself is NOT rotated here — Microsoft will keep issuing
+    new access tokens from the same refresh token until it expires (~90 days
+    of inactivity) or is revoked.  Re-run generate_refresh_token.py before
+    the 90-day window to obtain a new refresh token.
+    """
+    app = PublicClientApplication(
+        OD_CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{OD_TENANT_ID}",
+    )
+    result = app.acquire_token_by_refresh_token(
+        OD_REFRESH_TOKEN,
+        scopes=["https://graph.microsoft.com/Files.ReadWrite"],
+    )
+    if "access_token" not in result:
+        error_desc = result.get("error_description", str(result))
+        raise RuntimeError(
+            f"OneDrive token refresh failed: {error_desc}\n"
+            "If the refresh token has expired, re-run generate_refresh_token.py "
+            "and update the OD_REFRESH_TOKEN GitHub Secret."
+        )
+    log.info("OneDrive delegated token obtained successfully.")
+    return result["access_token"]
 
 
-# ─── Folder resolution ────────────────────────────────────────────────────────────
+# ─── Folder resolution ─────────────────────────────────────────────────────────
 def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
     """
     Return the Graph API folder ID for a named subfolder inside the target mailbox.
@@ -256,7 +294,7 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
     return None
 
 
-# ─── Fetch & mark emails ──────────────────────────────────────────────────────────
+# ─── Fetch & mark emails ───────────────────────────────────────────────────────
 def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> list[dict]:
     headers = {"Authorization": f"Bearer {token}"}
     if folder_id:
@@ -292,7 +330,7 @@ def mark_email_read(token: str, message_id: str) -> None:
     )
 
 
-# ─── Subject parsing ──────────────────────────────────────────────────────────────
+# ─── Subject parsing ───────────────────────────────────────────────────────────
 SUBJECT_RE = re.compile(r"^(?P<code>[A-Z]{2,5})\s*:\s*(?P<rest>.+)$", re.IGNORECASE)
 IGNORE_RE  = re.compile(r"^(fw|fwd|re|aw)\s*:", re.IGNORECASE)
 
@@ -335,7 +373,7 @@ def parse_subject(subject: str) -> Optional[tuple[str, str, Optional[str]]]:
     return code, skill, jr_no
 
 
-# ─── HTML table parser ────────────────────────────────────────────────────────────
+# ─── HTML table parser ─────────────────────────────────────────────────────────
 def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
@@ -378,16 +416,13 @@ def parse_html_table(html: str) -> list[dict]:
     return rows
 
 
-# ─── OneDrive attachment upload ───────────────────────────────────────────────────
+# ─── OneDrive attachment upload ────────────────────────────────────────────────
 def _is_resume(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in RESUME_EXTENSIONS
 
 
 def _fetch_attachment_content(mail_token: str, message_id: str, attachment_id: str) -> bytes:
-    """
-    Download raw attachment bytes using the mail token and TARGET_MAILBOX.
-    Mail reading always uses TARGET_MAILBOX — unchanged from original.
-    """
+    """Download raw attachment bytes using the mail token and TARGET_MAILBOX."""
     url = (
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
         f"/messages/{message_id}/attachments/{attachment_id}/$value"
@@ -399,19 +434,16 @@ def _fetch_attachment_content(mail_token: str, message_id: str, attachment_id: s
 
 def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optional[str]:
     """
-    Upload a resume file to OneDrive.
-
-    FIX: Uses ONEDRIVE_USER (your personal email) instead of TARGET_MAILBOX.
-    The OD app has Files.ReadWrite access to your personal OneDrive —
-    that is why uploads worked before and why pointing to TARGET_MAILBOX
-    caused the 401 error (the OD app has no access to that mailbox's drive).
+    Upload a resume file to ONEDRIVE_USER's personal OneDrive using a
+    delegated access token (obtained via refresh token — no app-level
+    Files.ReadWrite.All permission required).
     """
     remote_path = f"{ONEDRIVE_FOLDER}/{filename}"
 
-    # FIX: ONEDRIVE_USER instead of TARGET_MAILBOX
+    # Use /me/drive when using a delegated token — this resolves to ONEDRIVE_USER
+    # because the token was issued on behalf of that user.
     upload_url = (
-        f"https://graph.microsoft.com/v1.0/users/{ONEDRIVE_USER}"
-        f"/drive/root:/{remote_path}:/content"
+        f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/content"
     )
 
     resp = requests.put(
@@ -433,11 +465,9 @@ def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optiona
     item    = resp.json()
     item_id = item.get("id")
 
-    # Create a shareable link for the uploaded file
-    # FIX: Also uses ONEDRIVE_USER here for the createLink call
+    # Create a shareable link
     link_resp = requests.post(
-        f"https://graph.microsoft.com/v1.0/users/{ONEDRIVE_USER}"
-        f"/drive/items/{item_id}/createLink",
+        f"https://graph.microsoft.com/v1.0/me/drive/items/{item_id}/createLink",
         headers={
             "Authorization": f"Bearer {od_token}",
             "Content-Type": "application/json",
@@ -463,7 +493,7 @@ def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optiona
 def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
     """
     Download resume attachments from email (mail_token + TARGET_MAILBOX)
-    and upload them to OneDrive (od_token + ONEDRIVE_USER).
+    and upload them to OneDrive (od_token scoped to ONEDRIVE_USER via /me/drive).
     """
     attachments = msg.get("attachments") or []
     if not attachments:
@@ -490,7 +520,7 @@ def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
     return ", ".join(links)
 
 
-# ─── DB schema helpers ─────────────────────────────────────────────────────────────
+# ─── DB schema helpers ──────────────────────────────────────────────────────────
 def ensure_tables(cur) -> None:
     cur.execute("""
         CREATE TABLE IF NOT EXISTS hr_processed_emails (
@@ -506,7 +536,7 @@ def ensure_tables(cur) -> None:
     """)
 
 
-# ─── Processed-email tracking ─────────────────────────────────────────────────────
+# ─── Processed-email tracking ──────────────────────────────────────────────────
 def is_email_processed(cur, message_id: str) -> bool:
     cur.execute(
         "SELECT 1 FROM hr_processed_emails WHERE message_id = %s LIMIT 1",
@@ -538,7 +568,7 @@ def mark_email_processed(
     )
 
 
-# ─── Smart duplicate detection & update ──────────────────────────────────────────
+# ─── Smart duplicate detection & update ───────────────────────────────────────
 def _select_cols_for_update() -> list[str]:
     return ["id"] + UPDATABLE_FIELDS
 
@@ -680,7 +710,7 @@ def apply_field_updates(cur, record_id: int, updates: dict) -> None:
     cur.execute(query, list(updates.values()) + [record_id])
 
 
-# ─── Standard duplicate flag ──────────────────────────────────────────────────────
+# ─── Standard duplicate flag ───────────────────────────────────────────────────
 def check_duplicate(cur, contact_number: str, email_id: str) -> str:
     if not contact_number and not email_id:
         return ""
@@ -716,7 +746,7 @@ def check_duplicate(cur, contact_number: str, email_id: str) -> str:
     return ""
 
 
-# ─── Email address helpers ────────────────────────────────────────────────────────
+# ─── Email address helpers ─────────────────────────────────────────────────────
 def _extract_address(addr_obj: dict) -> str:
     try:
         return addr_obj["emailAddress"]["address"].strip().lower()
@@ -750,7 +780,7 @@ def _delivery_type(from_addr: str, to_addr: str) -> str:
     )
 
 
-# ─── Record validation ────────────────────────────────────────────────────────────
+# ─── Record validation ─────────────────────────────────────────────────────────
 _REQUIRED_FIELDS = (
     "name_of_candidate", "contact_number", "email_id",
     "general_skill", "company_name",
@@ -766,7 +796,7 @@ def _record_status(data: dict) -> str:
     return "Pass"
 
 
-# ─── DB insertion ─────────────────────────────────────────────────────────────────
+# ─── DB insertion ──────────────────────────────────────────────────────────────
 _SAFE_FIELDS = (
     "recruiter", "client_recruiter", "general_skill", "company_name",
     "email_from", "email_to", "delivery_type", "email_id",
@@ -829,7 +859,7 @@ def insert_record(cur, data: dict) -> bool:
             return False
 
 
-# ─── Date parsing ─────────────────────────────────────────────────────────────────
+# ─── Date parsing ──────────────────────────────────────────────────────────────
 _DATE_FORMATS = ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y")
 
 
@@ -842,7 +872,7 @@ def _parse_date(raw: str) -> Optional[date]:
     return None
 
 
-# ─── Main pipeline ────────────────────────────────────────────────────────────────
+# ─── Main pipeline ─────────────────────────────────────────────────────────────
 def process_emails() -> None:
     log.info("=== HR Email Extractor starting ===")
     log.info(f"Target mailbox : {TARGET_MAILBOX}")
@@ -854,9 +884,9 @@ def process_emails() -> None:
     od_token = get_onedrive_token()
     log.info("Tokens obtained.")
 
-    # Verify OneDrive access against ONEDRIVE_USER at startup
+    # Verify OneDrive access — using /me/drive with the delegated token
     _drive_check = requests.get(
-        f"https://graph.microsoft.com/v1.0/users/{ONEDRIVE_USER}/drive",
+        "https://graph.microsoft.com/v1.0/me/drive",
         headers={"Authorization": f"Bearer {od_token}"},
         timeout=10,
     )
@@ -909,8 +939,6 @@ def process_emails() -> None:
         client_recruiter = _username_from_email(to_addr)
         delivery_type    = _delivery_type(from_addr, to_addr)
 
-        # mail_token reads attachments from TARGET_MAILBOX
-        # od_token uploads files to ONEDRIVE_USER's personal drive
         attachment_str = upload_attachments(od_token, token, msg)
 
         body_html = (msg.get("body") or {}).get("content", "")
@@ -950,7 +978,7 @@ def process_emails() -> None:
             effective_jr_no = _t(row.get("jr_no")) or subject_jr_no
             candidate_name  = _t(row.get("name_of_candidate"))
 
-            # ── TIER 1: Same recruiter — auto-update empty fields ──────────────
+            # ── TIER 1: Same recruiter — auto-update empty fields ─────────────
             same_key = find_same_key_record(
                 cur, row_date,
                 contact_number   or "",
@@ -1005,7 +1033,7 @@ def process_emails() -> None:
                 })
                 continue
 
-            # ── TIER 2: Different recruiter — insert immediately, notify ────────
+            # ── TIER 2: Different recruiter — insert immediately, notify ───────
             diff_key = find_different_recruiter_record(
                 cur, row_date,
                 contact_number  or "",
@@ -1097,14 +1125,14 @@ def process_emails() -> None:
                 })
                 continue
 
-            # ── TIER 2.5: Same contact/email, different JR — flag only ──────────
+            # ── TIER 2.5: Same contact/email, different JR — flag only ─────────
             contact_dup = find_contact_email_only_duplicate(
                 cur,
                 contact_number or "",
                 email_id_val   or "",
             )
 
-            # ── TIER 3: No matching record — standard insert path ───────────────
+            # ── TIER 3: No matching record — standard insert path ──────────────
             dup_flag = check_duplicate(cur, contact_number or "", email_id_val or "")
 
             record_data = {
