@@ -20,6 +20,7 @@ jobs:
       OD_TENANT_ID:        ${{ secrets.OD_TENANT_ID }}
       OD_CLIENT_ID:        ${{ secrets.OD_CLIENT_ID }}
       OD_CLIENT_SECRET:    ${{ secrets.OD_CLIENT_SECRET }}
+      ONEDRIVE_USER:       ${{ secrets.ONEDRIVE_USER }}
       # Shared config
       TARGET_MAILBOX:      ${{ secrets.TARGET_MAILBOX }}
       DB_DSN:              ${{ secrets.DB_DSN }}
