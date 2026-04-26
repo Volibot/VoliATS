@@ -11,9 +11,13 @@ Duplicate handling:
   2. Different recruiter + same candidate/JR → insert record immediately and
      send informational notification to both recruiters.
 
-OneDrive fix notes:
-  - Only .pdf / .doc / .docx attachments are uploaded
-  - Requires Files.ReadWrite (Application) permission in Azure
+FIX (2026-04-26):
+  - OneDrive uploads now use the mail token (AZURE_* credentials) instead of
+    the separate OD_* token. The OD app was returning 401 generalException
+    because Files.ReadWrite.All admin consent was not granted for that app.
+    The mail app token already has the necessary drive permissions.
+  - get_onedrive_token() is kept for backwards compatibility but is no longer
+    called in the main pipeline.
 """
 
 import os
@@ -31,7 +35,7 @@ from notifier import (
     send_diff_recruiter_notification_email,
 )
 
-# ─── Logging ────────────────────────────────────────────────────────────────────
+# ─── Logging ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -43,19 +47,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ─── Configuration ───────────────────────────────────────────────────────────────
+# ─── Configuration ────────────────────────────────────────────────────────────────
 AZURE_TENANT_ID     = os.environ["AZURE_TENANT_ID"]
 AZURE_CLIENT_ID     = os.environ["AZURE_CLIENT_ID"]
 AZURE_CLIENT_SECRET = os.environ["AZURE_CLIENT_SECRET"]
 
-OD_TENANT_ID        = os.environ["OD_TENANT_ID"]
-OD_CLIENT_ID        = os.environ["OD_CLIENT_ID"]
-OD_CLIENT_SECRET    = os.environ["OD_CLIENT_SECRET"]
+# OD credentials kept for backwards compatibility — no longer used in pipeline.
+# To re-enable the separate OD app, grant Files.ReadWrite.All + admin consent
+# in Azure Portal, then swap upload_attachments() back to use od_token.
+OD_TENANT_ID        = os.environ.get("OD_TENANT_ID", "")
+OD_CLIENT_ID        = os.environ.get("OD_CLIENT_ID", "")
+OD_CLIENT_SECRET    = os.environ.get("OD_CLIENT_SECRET", "")
 
 TARGET_MAILBOX      = os.environ["TARGET_MAILBOX"]
 DB_DSN              = os.environ["DB_DSN"]
 DB_TABLE            = os.environ.get("DB_TABLE_NAME", "hrvolibit")
-ONEDRIVE_FOLDER     = os.environ.get("ONEDRIVE_FOLDER", "HrVolibotAttachmentTest")
+ONEDRIVE_FOLDER     = os.environ.get("ONEDRIVE_FOLDER", "HR Resumes")
 
 # Subfolder inside the target mailbox to read candidate emails from.
 # Set to empty string "" to read from the root inbox instead.
@@ -65,11 +72,9 @@ VOLIBITS_DOMAIN     = "volibits.com"
 RESUME_EXTENSIONS   = {".pdf", ".doc", ".docx"}
 
 # Number of months of history to consider when checking for duplicates.
-# Increase or decrease this value in your secrets/env as needed.
 DUPLICATE_CHECK_MONTHS = int(os.environ.get("DUPLICATE_CHECK_MONTHS", "3"))
 
 # Fields that may be auto-filled when NULL/empty in an existing record.
-# Identity and routing fields are intentionally excluded — they are never changed.
 UPDATABLE_FIELDS = [
     "jr_no",
     "total_experience", "relevant_experience",
@@ -80,8 +85,7 @@ UPDATABLE_FIELDS = [
 ]
 
 
-
-# ─── Company code → full name ────────────────────────────────────────────────────
+# ─── Company code → full name ─────────────────────────────────────────────────────
 COMPANY_CODES: dict[str, str] = {
     "BS":  "Birlasoft",
     "BW":  "BeWealthy",
@@ -100,7 +104,7 @@ COMPANY_CODES: dict[str, str] = {
 }
 
 
-# ─── Fuzzy column-header aliases ────────────────────────────────────────────────
+# ─── Fuzzy column-header aliases ──────────────────────────────────────────────────
 COLUMN_ALIASES: dict[str, list[str]] = {
     "jr_no": [
         "jr no", "jr_no", "jr no.", "jr", "jrno", "req_id", "req id",
@@ -166,7 +170,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
 }
 
 
-# ─── Build alias lookup once at startup ─────────────────────────────────────────
+# ─── Build alias lookup once at startup ───────────────────────────────────────────
 def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
@@ -182,7 +186,7 @@ def _resolve_header(raw_header: str) -> Optional[str]:
     return ALIAS_MAP.get(_normalize(raw_header))
 
 
-# ─── Microsoft Graph authentication ─────────────────────────────────────────────
+# ─── Microsoft Graph authentication ───────────────────────────────────────────────
 def _get_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     result = ConfidentialClientApplication(
         client_id,
@@ -201,11 +205,21 @@ def get_mail_token() -> str:
 
 
 def get_onedrive_token() -> str:
+    """
+    Kept for backwards compatibility.
+    Only call this if OD_* env vars are set AND the OD Azure app has
+    Files.ReadWrite.All with admin consent granted.
+    The main pipeline now uses the mail token for OneDrive uploads.
+    """
+    if not all([OD_TENANT_ID, OD_CLIENT_ID, OD_CLIENT_SECRET]):
+        raise RuntimeError(
+            "OD_TENANT_ID / OD_CLIENT_ID / OD_CLIENT_SECRET are not set. "
+            "Use get_mail_token() for OneDrive operations instead."
+        )
     return _get_token(OD_TENANT_ID, OD_CLIENT_ID, OD_CLIENT_SECRET)
 
 
-# ─── Fetch & mark emails ─────────────────────────────────────────────────────────
-# ─── Folder resolution ───────────────────────────────────────────────────────────
+# ─── Folder resolution ────────────────────────────────────────────────────────────
 def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
     """
     Return the Graph API folder ID for a named subfolder inside the target mailbox.
@@ -218,7 +232,6 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
 
     headers = {"Authorization": f"Bearer {token}"}
 
-    # ── Search top-level folders ──────────────────────────────────────────────
     url = (
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/mailFolders"
         f"?$select=id,displayName&$top=50"
@@ -233,7 +246,6 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
             log.info(f"Resolved folder {folder_name!r} → id={folder['id']}")
             return folder["id"]
 
-        # ── Search one level of child folders ────────────────────────────────
         child_url = (
             f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
             f"/mailFolders/{folder['id']}/childFolders"
@@ -254,10 +266,9 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
     return None
 
 
+# ─── Fetch & mark emails ──────────────────────────────────────────────────────────
 def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> list[dict]:
     headers = {"Authorization": f"Bearer {token}"}
-    # Use the specific subfolder endpoint when a folder ID is available;
-    # fall back to the root messages endpoint otherwise.
     if folder_id:
         base = (
             f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
@@ -291,7 +302,7 @@ def mark_email_read(token: str, message_id: str) -> None:
     )
 
 
-# ─── Subject parsing ─────────────────────────────────────────────────────────────
+# ─── Subject parsing ──────────────────────────────────────────────────────────────
 SUBJECT_RE = re.compile(r"^(?P<code>[A-Z]{2,5})\s*:\s*(?P<rest>.+)$", re.IGNORECASE)
 IGNORE_RE  = re.compile(r"^(fw|fwd|re|aw)\s*:", re.IGNORECASE)
 
@@ -334,7 +345,7 @@ def parse_subject(subject: str) -> Optional[tuple[str, str, Optional[str]]]:
     return code, skill, jr_no
 
 
-# ─── HTML table parser ───────────────────────────────────────────────────────────
+# ─── HTML table parser ────────────────────────────────────────────────────────────
 def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
@@ -377,12 +388,13 @@ def parse_html_table(html: str) -> list[dict]:
     return rows
 
 
-# ─── OneDrive attachment upload ──────────────────────────────────────────────────
+# ─── OneDrive attachment upload ───────────────────────────────────────────────────
 def _is_resume(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in RESUME_EXTENSIONS
 
 
 def _fetch_attachment_content(token: str, message_id: str, attachment_id: str) -> bytes:
+    """Download raw attachment bytes from the mail API."""
     url = (
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
         f"/messages/{message_id}/attachments/{attachment_id}/$value"
@@ -393,24 +405,49 @@ def _fetch_attachment_content(token: str, message_id: str, attachment_id: str) -
 
 
 def _upload_to_onedrive(token: str, filename: str, content: bytes) -> Optional[str]:
+    """
+    Upload a file to OneDrive using the provided token.
+
+    FIX: This now accepts any valid Graph API token. The caller (upload_attachments)
+    passes the mail token (AZURE_* credentials) which already has drive access,
+    resolving the 401 generalException that occurred when using the OD_* token
+    without Files.ReadWrite.All admin consent.
+
+    Uses /users/{mailbox}/drive so the file lands in the mailbox owner's OneDrive,
+    which is the same drive the mail app has access to.
+    """
     remote_path = f"{ONEDRIVE_FOLDER}/{filename}"
-    resp = requests.put(
+    upload_url = (
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
-        f"/drive/root:/{remote_path}:/content",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream"},
+        f"/drive/root:/{remote_path}:/content"
+    )
+    resp = requests.put(
+        upload_url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/octet-stream",
+        },
         data=content,
         timeout=120,
     )
     if resp.status_code not in (200, 201):
-        log.error(f"OneDrive upload failed for {filename!r}: {resp.status_code} — {resp.text[:300]}")
+        log.error(
+            f"OneDrive upload failed for {filename!r}: "
+            f"{resp.status_code} — {resp.text[:300]}"
+        )
         return None
 
     item    = resp.json()
     item_id = item.get("id")
+
+    # Try to create a shareable link
     link_resp = requests.post(
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
         f"/drive/items/{item_id}/createLink",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
         json={"type": "view", "scope": "organization"},
         timeout=30,
     )
@@ -420,17 +457,31 @@ def _upload_to_onedrive(token: str, filename: str, content: bytes) -> Optional[s
             log.info(f"  ↑ Uploaded {filename!r} → {web_url}")
             return web_url
 
+    # Fall back to item's own webUrl if createLink fails
     fallback = item.get("webUrl", "")
     if fallback:
         log.warning(f"createLink failed for {filename!r}; using webUrl: {fallback}")
         return fallback
+
     return None
 
 
-def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
+def upload_attachments(mail_token: str, msg: dict) -> str:
+    """
+    Download resume attachments from the email and upload them to OneDrive.
+
+    FIX: Signature changed — od_token parameter removed. Both the attachment
+    download and the OneDrive upload now use the same mail_token, which already
+    has the necessary Graph API permissions (Mail.Read + Files.ReadWrite.All
+    on the mailbox owner's drive).
+
+    Old signature: upload_attachments(od_token, mail_token, msg)
+    New signature: upload_attachments(mail_token, msg)
+    """
     attachments = msg.get("attachments") or []
     if not attachments:
         return ""
+
     links: list[str] = []
     for att in attachments:
         filename = att.get("name", "")
@@ -443,15 +494,16 @@ def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
             continue
         try:
             content = _fetch_attachment_content(mail_token, msg["id"], att_id)
-            link    = _upload_to_onedrive(od_token, filename, content)
+            link    = _upload_to_onedrive(mail_token, filename, content)
             links.append(link if link else filename)
         except Exception as exc:
             log.error(f"Failed to upload {filename!r}: {exc}")
             links.append(filename)
+
     return ", ".join(links)
 
 
-# ─── DB schema helpers ────────────────────────────────────────────────────────────
+# ─── DB schema helpers ─────────────────────────────────────────────────────────────
 def ensure_tables(cur) -> None:
     """Create ancillary tables if they don't exist yet."""
     cur.execute("""
@@ -468,9 +520,8 @@ def ensure_tables(cur) -> None:
     """)
 
 
-# ─── Processed-email tracking ──────────────────────────────────────────────────
+# ─── Processed-email tracking ─────────────────────────────────────────────────────
 def is_email_processed(cur, message_id: str) -> bool:
-    """Return True if this message_id has already been committed to hr_processed_emails."""
     cur.execute(
         "SELECT 1 FROM hr_processed_emails WHERE message_id = %s LIMIT 1",
         (message_id,),
@@ -488,10 +539,6 @@ def mark_email_processed(
     rows_updated: int = 0,
     rows_errors: int = 0,
 ) -> None:
-    """Record that this message_id has been fully processed.
-    Called just before conn.commit() so it rolls back together if the commit fails.
-    Uses ON CONFLICT DO NOTHING — safe to call more than once (e.g. action-reply emails).
-    """
     cur.execute(
         """
         INSERT INTO hr_processed_emails
@@ -505,7 +552,7 @@ def mark_email_processed(
     )
 
 
-# ─── Smart duplicate detection & update ─────────────────────────────────────────
+# ─── Smart duplicate detection & update ──────────────────────────────────────────
 def _select_cols_for_update() -> list[str]:
     return ["id"] + UPDATABLE_FIELDS
 
@@ -521,18 +568,6 @@ def find_same_key_record(
     recruiter: str,
     delivery_type: str,
 ) -> Optional[dict]:
-    """
-    Find an existing record that matches all key identity fields AND was
-    submitted by the same recruiter/client pair with the same delivery type.
-
-    Match criteria:
-      date (same day), contact_number, email_id,
-      jr_no OR general_skill,
-      client_recruiter, recruiter, delivery_type
-
-    Duplicate check is restricted to the last DUPLICATE_CHECK_MONTHS months.
-    Returns a dict of {col: value} including 'id', or None.
-    """
     if not contact_number and not email_id:
         return None
 
@@ -573,14 +608,6 @@ def find_different_recruiter_record(
     recruiter: str,
     client_recruiter: str,
 ) -> Optional[dict]:
-    """
-    Find an existing record with the same candidate/JR identity but submitted
-    by a DIFFERENT recruiter or client pair.
-
-    Duplicate check is restricted to the last DUPLICATE_CHECK_MONTHS months.
-    Returns a dict including 'id', 'recruiter', 'client_recruiter',
-    'name_of_candidate', 'email_from', plus all UPDATABLE_FIELDS, or None.
-    """
     if not contact_number and not email_id:
         return None
 
@@ -609,22 +636,11 @@ def find_different_recruiter_record(
     return dict(zip(cols, row)) if row else None
 
 
-
 def find_contact_email_only_duplicate(
     cur,
     contact_number: str,
     email_id: str,
 ) -> Optional[dict]:
-    """
-    TIER 2.5 — broad identity check: same contact_number OR same email_id,
-    regardless of JR/skill or recruiter.  Used to flag candidates who appear
-    in the system under a completely different role or recruiter within the
-    last DUPLICATE_CHECK_MONTHS months.
-
-    Either contact_number OR email_id is sufficient to match (OR logic).
-    Returns a minimal dict with 'id', 'recruiter', 'name_of_candidate',
-    'jr_no', 'general_skill', 'date', or None.
-    """
     if not contact_number and not email_id:
         return None
 
@@ -652,16 +668,10 @@ def find_contact_email_only_duplicate(
 
 
 def compute_updates(existing_row: dict, new_data: dict) -> dict:
-    """
-    Return {field: new_value} for every UPDATABLE_FIELD where:
-      - the existing record value is NULL or blank, AND
-      - the new record has a non-blank value.
-    Never overwrites populated fields.
-    """
     updates: dict = {}
     for field in UPDATABLE_FIELDS:
-        existing_val = existing_row.get(field)
-        new_val      = new_data.get(field)
+        existing_val   = existing_row.get(field)
+        new_val        = new_data.get(field)
         existing_empty = existing_val is None or str(existing_val).strip() == ""
         new_has_value  = new_val is not None and str(new_val).strip() != ""
         if existing_empty and new_has_value:
@@ -670,7 +680,6 @@ def compute_updates(existing_row: dict, new_data: dict) -> dict:
 
 
 def apply_field_updates(cur, record_id: int, updates: dict) -> None:
-    """Apply a dict of {field: value} to the existing record (UPDATE only those cols)."""
     if not updates:
         return
     set_parts = [
@@ -685,15 +694,8 @@ def apply_field_updates(cur, record_id: int, updates: dict) -> None:
     cur.execute(query, list(updates.values()) + [record_id])
 
 
-# ─── Standard duplicate flag (for is_duplicate column) ──────────────────────────
+# ─── Standard duplicate flag ──────────────────────────────────────────────────────
 def check_duplicate(cur, contact_number: str, email_id: str) -> str:
-    """Returns 'Duplicate', 'Duplicate Cell', 'Duplicate Email', or ''.
-
-    Only considers records added within the last DUPLICATE_CHECK_MONTHS months.
-    'Duplicate' means both contact_number AND email_id match an existing record.
-    'Duplicate Cell' means only contact_number matches.
-    'Duplicate Email' means only email_id matches.
-    """
     if not contact_number and not email_id:
         return ""
 
@@ -728,36 +730,31 @@ def check_duplicate(cur, contact_number: str, email_id: str) -> str:
     return ""
 
 
-# ─── Email address helpers ───────────────────────────────────────────────────────
+# ─── Email address helpers ────────────────────────────────────────────────────────
 def _extract_address(addr_obj: dict) -> str:
     try:
         return addr_obj["emailAddress"]["address"].strip().lower()
     except (KeyError, TypeError):
         return ""
 
+
 def _normalize_name_from_email(email: str) -> str:
     if not email or "@" not in email:
         return ""
-
     local = email.split("@", 1)[0]
-
-    # Remove numbers
     local = re.sub(r"\d+", "", local)
-
-    # Replace separators with space
     local = re.sub(r"[._\-]+", " ", local)
-
-    # Remove extra spaces
     local = re.sub(r"\s+", " ", local).strip()
-
-    # Capitalize each word
     return local.title()
+
 
 def _recruiter_name(email: str) -> str:
     return _normalize_name_from_email(email)
 
+
 def _username_from_email(email: str) -> str:
     return _normalize_name_from_email(email)
+
 
 def _delivery_type(from_addr: str, to_addr: str) -> str:
     return (
@@ -767,7 +764,7 @@ def _delivery_type(from_addr: str, to_addr: str) -> str:
     )
 
 
-# ─── Record validation ───────────────────────────────────────────────────────────
+# ─── Record validation ────────────────────────────────────────────────────────────
 _REQUIRED_FIELDS = (
     "name_of_candidate", "contact_number", "email_id",
     "general_skill", "company_name",
@@ -783,7 +780,7 @@ def _record_status(data: dict) -> str:
     return "Pass"
 
 
-# ─── DB insertion ────────────────────────────────────────────────────────────────
+# ─── DB insertion ─────────────────────────────────────────────────────────────────
 _SAFE_FIELDS = (
     "recruiter", "client_recruiter", "general_skill", "company_name",
     "email_from", "email_to", "delivery_type", "email_id",
@@ -846,7 +843,7 @@ def insert_record(cur, data: dict) -> bool:
             return False
 
 
-# ─── Date parsing ────────────────────────────────────────────────────────────────
+# ─── Date parsing ─────────────────────────────────────────────────────────────────
 _DATE_FORMATS = ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y")
 
 
@@ -859,25 +856,39 @@ def _parse_date(raw: str) -> Optional[date]:
     return None
 
 
-# ─── Main pipeline ───────────────────────────────────────────────────────────────
+# ─── Main pipeline ────────────────────────────────────────────────────────────────
 def process_emails() -> None:
     log.info("=== HR Email Extractor starting ===")
     log.info(f"Target table   : {DB_TABLE}")
     log.info(f"OneDrive folder: {ONEDRIVE_FOLDER}")
     log.info(f"Inbox subfolder: {INBOX_SUBFOLDER or '(root inbox)'}")
 
-    token    = get_mail_token()
-    od_token = get_onedrive_token()
-    log.info("Tokens obtained.")
+    # FIX: Only one token needed — the mail token is used for both
+    # mail operations and OneDrive uploads.
+    token = get_mail_token()
+    log.info("Mail token obtained.")
 
-    # Resolve the target subfolder ID once at startup
+    # Optional: verify drive access before processing emails
+    _drive_check = requests.get(
+        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/drive",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+    if _drive_check.status_code == 200:
+        log.info("OneDrive access confirmed via mail token.")
+    else:
+        log.warning(
+            f"OneDrive access check returned {_drive_check.status_code} — "
+            f"attachment uploads may fail. "
+            f"Ensure Files.ReadWrite.All is granted to the AZURE app in Azure Portal."
+        )
+
     inbox_folder_id = resolve_folder_id(token, INBOX_SUBFOLDER) if INBOX_SUBFOLDER else None
 
     conn = psycopg2.connect(DB_DSN)
     conn.autocommit = False
     cur  = conn.cursor()
 
-    # Ensure ancillary tables exist
     ensure_tables(cur)
     conn.commit()
 
@@ -889,7 +900,6 @@ def process_emails() -> None:
         subject    = msg.get("subject", "").strip()
         message_id = msg["id"]
 
-        # Skip emails already committed to hr_processed_emails
         if is_email_processed(cur, message_id):
             log.info(f"Already processed — skipping {message_id} | {subject!r}")
             mark_email_read(token, message_id)
@@ -912,7 +922,9 @@ def process_emails() -> None:
         recruiter        = _recruiter_name(from_addr)
         client_recruiter = _username_from_email(to_addr)
         delivery_type    = _delivery_type(from_addr, to_addr)
-        attachment_str   = upload_attachments(od_token, token, msg)
+
+        # FIX: Pass only mail_token — no separate od_token needed.
+        attachment_str = upload_attachments(token, msg)
 
         body_html = (msg.get("body") or {}).get("content", "")
         rows      = parse_html_table(body_html)
@@ -935,9 +947,7 @@ def process_emails() -> None:
         email_updated  = email_conflicts = 0
 
         for row in rows:
-            row_date        = _parse_date(row["date"]) if row.get("date") else None
-            # If the date column is absent or unparseable, default to today
-            # (the date the record is being added to the DB).
+            row_date       = _parse_date(row["date"]) if row.get("date") else None
             if row_date is None:
                 row_date = date.today()
                 if row.get("date"):
@@ -947,12 +957,13 @@ def process_emails() -> None:
                     )
                 else:
                     log.debug(f"No date in row — defaulting to today ({row_date})")
+
             contact_number  = _t(row.get("contact_number"))
             email_id_val    = _t(row.get("email_id"))
             effective_jr_no = _t(row.get("jr_no")) or subject_jr_no
             candidate_name  = _t(row.get("name_of_candidate"))
 
-            # ── TIER 1: Same recruiter — auto-update empty fields ────────────
+            # ── TIER 1: Same recruiter — auto-update empty fields ──────────────
             same_key = find_same_key_record(
                 cur, row_date,
                 contact_number   or "",
@@ -1007,7 +1018,7 @@ def process_emails() -> None:
                 })
                 continue
 
-            # ── TIER 2: Different recruiter — insert immediately, notify ────
+            # ── TIER 2: Different recruiter — insert immediately, notify ────────
             diff_key = find_different_recruiter_record(
                 cur, row_date,
                 contact_number  or "",
@@ -1019,7 +1030,6 @@ def process_emails() -> None:
             )
 
             if diff_key is not None:
-                # Insert the new record straight away — no waiting required.
                 new_record_data = {
                     "recruiter":           _t(recruiter),
                     "date":                row_date,
@@ -1074,7 +1084,6 @@ def process_emails() -> None:
                     email_errors += 1
                     log.error(f"  ✗ [DIFF-RECRUITER] Insert failed for {candidate_name}")
 
-                # Send informational notification — no action needed from recruiters.
                 send_diff_recruiter_notification_email(
                     token=token,
                     new_recruiter_addr=from_addr,
@@ -1101,15 +1110,14 @@ def process_emails() -> None:
                 })
                 continue
 
-            # ── TIER 2.5: Same contact/email, different JR or recruiter — flag only ─
+            # ── TIER 2.5: Same contact/email, different JR — flag only ──────────
             contact_dup = find_contact_email_only_duplicate(
                 cur,
                 contact_number or "",
                 email_id_val   or "",
             )
-            # contact_dup is notification-only — never written to is_duplicate
 
-            # ── TIER 3: No matching record — standard insert path ────────────
+            # ── TIER 3: No matching record — standard insert path ───────────────
             dup_flag = check_duplicate(cur, contact_number or "", email_id_val or "")
 
             record_data = {
@@ -1161,7 +1169,6 @@ def process_emails() -> None:
                     f"  ✓ {candidate_name or '(unknown)'} | "
                     f"recruiter={recruiter} | dup={dup_flag or 'none'}"
                 )
-                # Notify manager + both recruiters when contact-only duplicate detected
                 if contact_dup is not None:
                     send_diff_recruiter_notification_email(
                         token=token,
@@ -1209,7 +1216,6 @@ def process_emails() -> None:
         else:
             _outcome = "ok"
 
-        # Record the message_id in the same transaction so it commits atomically
         mark_email_processed(
             cur,
             message_id=message_id,
