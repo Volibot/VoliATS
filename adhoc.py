@@ -1,14 +1,15 @@
 """
-Ad-hoc extractor: pulls BS candidate emails from "Company Profiles" subfolder
-received on or after 2026-01-01 and writes all parsed fields to an Excel file.
+Ad-hoc extractor: pulls candidate emails from "Company Profiles" subfolder
+received on or after 2026-01-01 and writes parsed fields to the
+`temp_hrvolibit_archive` PostgreSQL table.
 
 Subject filters accepted:
-  - BS: ...
-  - [External]: BS: ...
+  - CODE: ...
+  - [External]: CODE: ...
 
-No database writes. No notifications. No OneDrive uploads. Read-only run.
+Attachments are uploaded to an Archive folder in OneDrive.
 
-Output: bs_candidates_<timestamp>.xlsx in the current working directory.
+Output: adhoc_candidates_<timestamp>.xlsx in the current working directory.
 
 Required env vars:
   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
@@ -42,12 +43,14 @@ import os
 import re
 import logging
 import requests
+import psycopg2
+from psycopg2 import sql as pgsql
 from datetime import datetime, date, timezone
 from typing import Optional
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
-from msal import ConfidentialClientApplication
+from msal import ConfidentialClientApplication, PublicClientApplication
 from dotenv import load_dotenv
 load_dotenv()
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -67,6 +70,30 @@ TARGET_MAILBOX  = os.environ["TARGET_MAILBOX"]
 INBOX_SUBFOLDER = os.environ.get("INBOX_SUBFOLDER", "Company Profiles")
 VOLIBITS_DOMAIN = "volibits.com"
 RESUME_EXTENSIONS = {".pdf", ".doc", ".docx"}
+
+OD_TENANT_ID        = os.environ["OD_TENANT_ID"]
+OD_CLIENT_ID        = os.environ["OD_CLIENT_ID"]
+OD_REFRESH_TOKEN    = os.environ["OD_REFRESH_TOKEN"]
+DB_DSN              = os.environ["DB_DSN"]
+DB_TABLE            = os.environ.get("DB_TABLE_NAME", "temp_hrvolibit_archive")
+ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "archive")
+
+COMPANY_CODES: dict[str, str] = {
+    "BS":  "Birlasoft",
+    "BW":  "BeWealthy",
+    "TCS": "TCS",
+    "INF": "Infosys",
+    "WIP": "Wipro",
+    "HCL": "HCL Technologies",
+    "ACC": "Accenture",
+    "CAP": "Capgemini",
+    "COG": "Cognizant",
+    "IBM": "IBM",
+    "SAP": "SAP",
+    "ORC": "Oracle",
+    "MS":  "Microsoft",
+    "RS":  "RS Software",
+}
 
 # Only pull emails from this date onwards
 SINCE_DATE = date(2026, 1, 1)
@@ -261,12 +288,134 @@ def fetch_bs_emails(token: str, folder_id: Optional[str]) -> list[dict]:
     return all_emails
 
 
-# ── Attachment filenames (fetched on-demand, no upload) ───────────────────────
+# ── OneDrive attachment helpers ──────────────────────────────────────────────
 def _is_resume(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in RESUME_EXTENSIONS
 
-def get_attachment_names(token: str, msg: dict) -> str:
-    """Fetch attachment metadata only for this message and return resume filenames."""
+def _fetch_attachment_content(mail_token: str, message_id: str, attachment_id: str) -> bytes:
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
+        f"/messages/{message_id}/attachments/{attachment_id}/$value"
+    )
+    resp = requests.get(url, headers={"Authorization": f"Bearer {mail_token}"}, timeout=60)
+    resp.raise_for_status()
+    return resp.content
+
+
+def _ensure_onedrive_folder(od_token: str, folder_name: str) -> None:
+    headers = {
+        "Authorization": f"Bearer {od_token}",
+        "Content-Type": "application/json",
+    }
+    check = requests.get(
+        f"https://graph.microsoft.com/v1.0/me/drive/root:/{folder_name}",
+        headers=headers,
+        timeout=30,
+    )
+    if check.status_code == 200:
+        log.info(f"OneDrive folder '{folder_name}' already exists.")
+        return
+
+    resp = requests.post(
+        "https://graph.microsoft.com/v1.0/me/drive/root/children",
+        headers=headers,
+        json={
+            "name": folder_name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "rename",
+        },
+        timeout=30,
+    )
+    if resp.status_code in (200, 201):
+        log.info(f"Created OneDrive folder '{folder_name}'.")
+    else:
+        log.warning(
+            f"Could not create OneDrive folder '{folder_name}': "
+            f"{resp.status_code} — {resp.text[:200]}"
+        )
+
+
+def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optional[str]:
+    remote_path = f"{ONEDRIVE_ARCHIVE_FOLDER}/{filename}" if ONEDRIVE_ARCHIVE_FOLDER else filename
+    upload_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/content"
+    resp = requests.put(
+        upload_url,
+        headers={
+            "Authorization": f"Bearer {od_token}",
+            "Content-Type": "application/octet-stream",
+        },
+        data=content,
+        timeout=120,
+    )
+    if resp.status_code not in (200, 201):
+        log.error(
+            f"OneDrive upload failed for {filename!r}: "
+            f"{resp.status_code} — {resp.text[:300]}"
+        )
+        return None
+
+    item = resp.json()
+    item_id = item.get("id")
+    link_resp = requests.post(
+        f"https://graph.microsoft.com/v1.0/me/drive/items/{item_id}/createLink",
+        headers={
+            "Authorization": f"Bearer {od_token}",
+            "Content-Type": "application/json",
+        },
+        json={"type": "view", "scope": "organization"},
+        timeout=30,
+    )
+    if link_resp.status_code in (200, 201):
+        web_url = link_resp.json().get("link", {}).get("webUrl", "")
+        if web_url:
+            log.info(f"  ↑ Uploaded {filename!r} → {web_url}")
+            return web_url
+
+    fallback = item.get("webUrl", "")
+    if fallback:
+        log.warning(f"createLink failed for {filename!r}; using webUrl: {fallback}")
+        return fallback
+
+    return None
+
+
+def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
+    if not msg.get("hasAttachments"):
+        return ""
+
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
+        f"/messages/{msg['id']}/attachments?$select=id,name,contentType"
+    )
+    try:
+        resp = requests.get(url, headers={"Authorization": f"Bearer {mail_token}"}, timeout=60)
+        resp.raise_for_status()
+        attachments = resp.json().get("value", [])
+    except Exception as exc:
+        log.warning(f"Could not fetch attachments for {msg['id']}: {exc}")
+        return ""
+
+    links: list[str] = []
+    for att in attachments:
+        filename = att.get("name", "")
+        if not filename or not _is_resume(filename):
+            log.debug(f"  ↷ Skipping non-resume attachment: {filename!r}")
+            continue
+        att_id = att.get("id", "")
+        if not att_id:
+            links.append(filename)
+            continue
+        try:
+            content = _fetch_attachment_content(mail_token, msg["id"], att_id)
+            link = _upload_to_onedrive(od_token, filename, content)
+            links.append(link if link else filename)
+        except Exception as exc:
+            log.error(f"Failed to upload {filename!r}: {exc}")
+            links.append(filename)
+
+    return ", ".join(links)
+
+# ── Subject filter ────────────────────────────────────────────────────────────
     if not msg.get("hasAttachments"):
         return ""
     url = (
@@ -283,8 +432,8 @@ def get_attachment_names(token: str, msg: dict) -> str:
         log.warning(f"Could not fetch attachments for {msg['id']}: {exc}")
         return ""
 # ── Subject filter ────────────────────────────────────────────────────────────
-BS_SUBJECT_RE = re.compile(
-    r"^(?:\[External\]\s*:\s*)?BS\s*:",
+SUBJECT_RE = re.compile(
+    r"(?<!\S)(?:\[External\]\s*:\s*)?(?P<code>[A-Za-z]{2,4})\s*:",
     re.IGNORECASE,
 )
 
@@ -298,25 +447,27 @@ _JR_PATTERNS = [
 ]
 
 def _extract_jr_and_skill(rest: str) -> tuple[Optional[str], str]:
-    rest = rest.strip()
+    rest = re.sub(r"^[-|%\s]+|[-|%\s]+$", "", rest.strip()).strip()
     jr_no = None
     for pat in _JR_PATTERNS:
         m = pat.search(rest)
         if m:
             jr_no = m.group("jr")
             s, e = m.span()
-            rest = re.sub(r"^[-|\s]+|[-|\s]+$", "", (rest[:s] + " " + rest[e:]).strip()).strip()
+            rest = re.sub(r"^[-|%\s]+|[-|%\s]+$", "", (rest[:s] + " " + rest[e:]).strip()).strip()
             break
     return jr_no, re.sub(r"\s{2,}", " ", rest).strip()
 
-def parse_bs_subject(subject: str) -> Optional[tuple[str, Optional[str]]]:
-    """Returns (general_skill, jr_no) for matching subjects, else None."""
+def parse_subject(subject: str) -> Optional[tuple[str, str, str, Optional[str]]]:
     subject = subject.strip()
-    if not BS_SUBJECT_RE.match(subject):
+    m = SUBJECT_RE.search(subject)
+    if not m:
         return None
-    rest = BS_SUBJECT_RE.sub("", subject).strip()
+    code = m.group("code").upper()
+    rest = subject[m.end():].strip()
+    company_name = COMPANY_CODES.get(code, code)
     jr_no, skill = _extract_jr_and_skill(rest)
-    return skill, jr_no
+    return code, company_name, skill, jr_no
 
 # ── HTML table parser ─────────────────────────────────────────────────────────
 def _strip_html(text: str) -> str:
@@ -345,20 +496,6 @@ def parse_html_table(html: str) -> list[dict]:
             if record:
                 rows.append(record)
     return rows
-
-# ── Attachment filenames (no upload) ─────────────────────────────────────────
-def _is_resume(filename: str) -> bool:
-    return os.path.splitext(filename)[1].lower() in RESUME_EXTENSIONS
-
-def get_attachment_names(msg: dict) -> str:
-    """Returns a comma-separated string of resume attachment filenames."""
-    attachments = msg.get("attachments") or []
-    names = [
-        att.get("name", "")
-        for att in attachments
-        if _is_resume(att.get("name", ""))
-    ]
-    return ", ".join(names)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _extract_address(addr_obj: dict) -> str:
@@ -469,7 +606,7 @@ def write_excel(records: list[dict], output_path: str) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def run() -> None:
-    log.info("=== BS Ad-hoc Extractor starting ===")
+    log.info("=== Ad-hoc extractor starting ===")
     log.info(f"Pulling emails from: {SINCE_DATE} onwards")
     log.info(f"Folder: {INBOX_SUBFOLDER or '(root inbox)'}")
 
@@ -484,12 +621,12 @@ def run() -> None:
 
     for msg in emails:
         subject = msg.get("subject", "").strip()
-        parsed  = parse_bs_subject(subject)
+        parsed  = parse_subject(subject)
         if parsed is None:
             skipped += 1
             continue
 
-        general_skill, subject_jr_no = parsed
+        company_code, company_name, general_skill, subject_jr_no = parsed
 
         from_addr = _extract_address(msg.get("from", {}))
         to_list   = msg.get("toRecipients", [])
@@ -536,7 +673,7 @@ def run() -> None:
                 "email_from":          from_addr,
                 "email_to":            to_addr,
                 "delivery_type":       delivery_type,
-                "company_name":        "Birlasoft",
+                "company_name":        company_name,
                 "general_skill":       _t(general_skill),
                 "date":                row_date,
                 "jr_no":               effective_jr_no,
@@ -558,7 +695,7 @@ def run() -> None:
                     "contact_number":    contact_number,
                     "email_id":          email_id_val,
                     "general_skill":     _t(general_skill),
-                    "company_name":      "Birlasoft",
+                    "company_name":      company_name,
                     "recruiter":         recruiter,
                     "email_from":        from_addr,
                     "email_to":          to_addr,
@@ -567,7 +704,7 @@ def run() -> None:
             records.append(record)
             log.info(f"  + {candidate_name or '(unknown)'} | {subject!r} | {row_date}")
 
-    log.info(f"Skipped {skipped} non-BS email(s).")
+    log.info(f"Skipped {skipped} email(s) with no recognized company code.")
     log.info(f"Total rows to write: {len(records)}")
 
     if not records:
@@ -575,7 +712,7 @@ def run() -> None:
         return
 
     ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = f"bs_candidates_{ts}.xlsx"
+    output_path = f"adhoc_candidates_{ts}.xlsx"
     write_excel(records, output_path)
     print(f"\n✅  Done — {len(records)} row(s) written to: {output_path}\n")
 
