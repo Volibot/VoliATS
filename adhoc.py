@@ -57,7 +57,7 @@ load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("bs_extract.log")],
+    handlers=[logging.StreamHandler(), logging.FileHandler("adhoc_extract.log")],
 )
 log = logging.getLogger(__name__)
 
@@ -73,10 +73,13 @@ RESUME_EXTENSIONS = {".pdf", ".doc", ".docx"}
 
 OD_TENANT_ID        = os.environ["OD_TENANT_ID"]
 OD_CLIENT_ID        = os.environ["OD_CLIENT_ID"]
+OD_CLIENT_SECRET    = os.environ.get("OD_CLIENT_SECRET", "")
 OD_REFRESH_TOKEN    = os.environ["OD_REFRESH_TOKEN"]
+ONEDRIVE_USER       = os.environ["ONEDRIVE_USER"]
 DB_DSN              = os.environ["DB_DSN"]
 DB_TABLE            = os.environ.get("DB_TABLE_NAME", "temp_hrvolibit_archive")
-ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "archive")
+ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "Archive")
+Limit               = int(os.environ.get("LIMIT", "100"))
 
 COMPANY_CODES: dict[str, str] = {
     "BS":  "Birlasoft",
@@ -216,14 +219,52 @@ def _resolve_header(raw: str) -> Optional[str]:
     return ALIAS_MAP.get(_normalize(raw))
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-def get_mail_token() -> str:
+def _get_app_token(tenant_id: str, client_id: str, client_secret: str) -> str:
+    """Client-credentials (app-only) token — used for mail reading."""
     result = ConfidentialClientApplication(
-        AZURE_CLIENT_ID,
-        authority=f"https://login.microsoftonline.com/{AZURE_TENANT_ID}",
-        client_credential=AZURE_CLIENT_SECRET,
+        client_id,
+        authority=f"https://login.microsoftonline.com/{tenant_id}",
+        client_credential=client_secret,
     ).acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
     if "access_token" not in result:
-        raise RuntimeError(f"Token failed: {result.get('error_description')}")
+        raise RuntimeError(
+            f"App token acquisition failed: {result.get('error_description')}"
+        )
+    return result["access_token"]
+
+
+def get_mail_token() -> str:
+    """App-only token for reading TARGET_MAILBOX via Mail.Read application permission."""
+    return _get_app_token(AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET)
+
+
+def get_onedrive_token() -> str:
+    """
+    Delegated token for ONEDRIVE_USER's personal OneDrive.
+
+    Uses a stored refresh token (OD_REFRESH_TOKEN) so no interactive login
+    is needed at runtime. The PublicClientApplication.acquire_token_by_refresh_token
+    call exchanges the refresh token for a fresh access token each run.
+
+    Refresh tokens last ~90 days. Re-run generate_refresh_token.py before
+    expiry and update the OD_REFRESH_TOKEN GitHub Secret.
+    """
+    app = PublicClientApplication(
+        OD_CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{OD_TENANT_ID}",
+    )
+    result = app.acquire_token_by_refresh_token(
+        OD_REFRESH_TOKEN,
+        scopes=["https://graph.microsoft.com/.default"],
+    )
+    if "access_token" not in result:
+        error_desc = result.get("error_description", str(result))
+        raise RuntimeError(
+            f"OneDrive token refresh failed: {error_desc}\n"
+            "If the refresh token has expired, re-run generate_refresh_token.py "
+            "and update the OD_REFRESH_TOKEN GitHub Secret."
+        )
+    log.info("OneDrive delegated token obtained successfully.")
     return result["access_token"]
 
 # ── Folder resolution ─────────────────────────────────────────────────────────
@@ -607,11 +648,32 @@ def write_excel(records: list[dict], output_path: str) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def run() -> None:
     log.info("=== Ad-hoc extractor starting ===")
+    log.info(f"Target mailbox : {TARGET_MAILBOX}")
+    log.info(f"OneDrive user  : {ONEDRIVE_USER}")
+    log.info(f"OneDrive folder: {ONEDRIVE_ARCHIVE_FOLDER}")
     log.info(f"Pulling emails from: {SINCE_DATE} onwards")
     log.info(f"Folder: {INBOX_SUBFOLDER or '(root inbox)'}")
 
     mail_token = get_mail_token()
-    log.info("Token obtained.")
+    od_token   = get_onedrive_token()
+    log.info("Tokens obtained.")
+
+    # Verify OneDrive access and ensure target folder exists
+    _drive_check = requests.get(
+        "https://graph.microsoft.com/v1.0/me/drive",
+        headers={"Authorization": f"Bearer {od_token}"},
+        timeout=30,
+    )
+    if _drive_check.status_code == 200:
+        log.info(f"OneDrive access confirmed for {ONEDRIVE_USER}.")
+        if ONEDRIVE_ARCHIVE_FOLDER:
+            _ensure_onedrive_folder(od_token, ONEDRIVE_ARCHIVE_FOLDER)
+    else:
+        log.warning(
+            f"OneDrive access check returned {_drive_check.status_code} for "
+            f"{ONEDRIVE_USER} — attachment uploads may fail. "
+            f"Response: {_drive_check.text[:200]}"
+        )
 
     folder_id = resolve_folder_id(mail_token, INBOX_SUBFOLDER) if INBOX_SUBFOLDER else None
     emails    = fetch_bs_emails(mail_token, folder_id)
@@ -640,7 +702,7 @@ def run() -> None:
             else "External"
         )
 
-        attachment_str = get_attachment_names(mail_token, msg)
+        attachment_str = upload_attachments(od_token, mail_token, msg)
 
         body_html = (msg.get("body") or {}).get("content", "")
         rows      = parse_html_table(body_html)
