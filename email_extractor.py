@@ -71,7 +71,7 @@ ONEDRIVE_FOLDER     = os.environ.get("ONEDRIVE_FOLDER", "HR Resumes")
 # Subfolder inside the target mailbox to read candidate emails from.
 # Set to empty string "" to read from the root inbox instead.
 INBOX_SUBFOLDER     = os.environ.get("INBOX_SUBFOLDER", "Company Profiles")
-
+Limit               = int(os.environ.get("LIMIT", "100"))
 VOLIBITS_DOMAIN     = "volibits.com"
 RESUME_EXTENSIONS   = {".pdf", ".doc", ".docx"}
 
@@ -294,10 +294,9 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
             f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
             f"/mailFolders/{folder_id}/messages"
         )
-        log.info(f"Fetching from folder id={folder_id}")
     else:
         base = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages"
-        log.info("Fetching from root inbox (no subfolder configured or resolved)")
+
     url = (
         f"{base}"
         f"?$top={top}"
@@ -306,11 +305,22 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
         f"&$expand=attachments($select=id,name,contentType,size)"
         f"&$orderby=receivedDateTime desc"
     )
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    emails = resp.json().get("value", [])
-    log.info(f"Fetched {len(emails)} email(s).")
-    return emails
+
+    all_emails: list[dict] = []
+    page = 0
+    while url:
+        page += 1
+        log.info(f"Fetching page {page} — {url[:80]}...")
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        batch = data.get("value", [])
+        all_emails.extend(batch)
+        log.info(f"  Page {page}: got {len(batch)} email(s) (total so far: {len(all_emails)})")
+        url = data.get("@odata.nextLink")  # None when no more pages
+
+    log.info(f"Fetched {len(all_emails)} email(s) total across {page} page(s).")
+    return all_emails
 
 
 def mark_email_read(token: str, message_id: str) -> None:
@@ -919,7 +929,14 @@ def insert_record(cur, data: dict) -> bool:
 
 
 # ─── Date parsing ──────────────────────────────────────────────────────────────
-_DATE_FORMATS = ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y")
+_DATE_FORMATS = (
+    "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y",
+    "%d-%b-%y", "%d-%b-%Y",   # 24-Apr-26, 24-Apr-2026
+    "%b-%d-%Y", "%b-%d-%y",   # Apr-24-2026, Apr-24-26
+    "%d/%b/%Y", "%d/%b/%y",   # 24/Apr/2026, 24/Apr/26
+    "%d %b %Y", "%d %b %y",   # 24 Apr 2026, 24 Apr 26
+    "%b %d %Y", "%b %d %y",   # Apr 24 2026, Apr 24 26
+)
 
 
 def _parse_date(raw: str) -> Optional[date]:
@@ -969,7 +986,7 @@ def process_emails() -> None:
     ensure_tables(cur)
     conn.commit()
 
-    emails = fetch_emails(token, top=200, folder_id=inbox_folder_id)
+    emails = fetch_emails(token, top=Limit, folder_id=inbox_folder_id)
 
     processed = skipped = inserted = updated = conflicts = errors = 0
 
