@@ -936,6 +936,11 @@ _DATE_FORMATS = (
     "%d/%b/%Y", "%d/%b/%y",   # 24/Apr/2026, 24/Apr/26
     "%d %b %Y", "%d %b %y",   # 24 Apr 2026, 24 Apr 26
     "%b %d %Y", "%b %d %y",   # Apr 24 2026, Apr 24 26
+    "%d-%B-%y", "%d-%B-%Y",   # 24-April-26, 24-April-2026
+    "%B-%d-%Y", "%B-%d-%y",   # April-24-2026, April-24-26
+    "%d/%B/%Y", "%d/%B/%y",   # 24/April/2026, 24/April/26
+    "%d %B %Y", "%d %B %y",   # 24 April 2026, 24 April 26
+    "%B %d %Y", "%B %d %y",   # April 24 2026, April 24 26
 )
 
 
