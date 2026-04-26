@@ -9,17 +9,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      # Mail-reading app
       AZURE_TENANT_ID:      ${{ secrets.AZURE_TENANT_ID }}
       AZURE_CLIENT_ID:      ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_CLIENT_SECRET:  ${{ secrets.AZURE_CLIENT_SECRET }}
-      # OneDrive upload app (delegated — refresh token, no client secret needed)
       OD_TENANT_ID:         ${{ secrets.OD_TENANT_ID }}
       OD_CLIENT_ID:         ${{ secrets.OD_CLIENT_ID }}
-      OD_CLIENT_SECRET:    ${{ secrets.OD_CLIENT_SECRET }}
+      OD_CLIENT_SECRET:     ${{ secrets.OD_CLIENT_SECRET }}
       OD_REFRESH_TOKEN:     ${{ secrets.OD_REFRESH_TOKEN }}
       ONEDRIVE_USER:        ${{ secrets.ONEDRIVE_USER }}
-      # Shared config
       TARGET_MAILBOX:       ${{ secrets.TARGET_MAILBOX }}
       DB_DSN:               ${{ secrets.DB_DSN }}
       DB_TABLE_NAME:        ${{ secrets.DB_TABLE_NAME }}
@@ -37,7 +34,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Run email extractor
-        run: python extractor.py
+        run: python email_extractor.py
       - name: Upload log on failure
         if: failure()
         uses: actions/upload-artifact@v4
