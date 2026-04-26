@@ -21,13 +21,12 @@ OneDrive auth:
 
 OneDrive notes:
   - Only .pdf / .doc / .docx attachments are uploaded.
-  - Drive uploads use ONEDRIVE_USER (your personal email) instead of
-    TARGET_MAILBOX, since the OD app has access to your personal OneDrive.
+  - Drive uploads use ONEDRIVE_USER (your personal email).
+  - The HR Resumes folder is auto-created on first run if it doesn't exist.
 """
 
 import os
 import re
-import json
 import logging
 import requests
 import psycopg2
@@ -59,11 +58,7 @@ AZURE_CLIENT_SECRET = os.environ["AZURE_CLIENT_SECRET"]
 
 OD_TENANT_ID        = os.environ["OD_TENANT_ID"]
 OD_CLIENT_ID        = os.environ["OD_CLIENT_ID"]
-# OD_CLIENT_SECRET is no longer used for OneDrive auth (delegated flow instead)
-# Keep it in your env if other parts of your system reference it.
-OD_CLIENT_SECRET    = os.environ.get("OD_CLIENT_SECRET", "")
-
-# Refresh token obtained via generate_refresh_token.py — store as GitHub Secret.
+OD_CLIENT_SECRET    = os.environ.get("OD_CLIENT_SECRET", "")  # kept for compat, not used
 OD_REFRESH_TOKEN    = os.environ["OD_REFRESH_TOKEN"]
 
 TARGET_MAILBOX      = os.environ["TARGET_MAILBOX"]
@@ -220,13 +215,11 @@ def get_onedrive_token() -> str:
     Delegated token for ONEDRIVE_USER's personal OneDrive.
 
     Uses a stored refresh token (OD_REFRESH_TOKEN) so no interactive login
-    is needed at runtime.  The PublicClientApplication.acquire_token_by_refresh_token
+    is needed at runtime. The PublicClientApplication.acquire_token_by_refresh_token
     call exchanges the refresh token for a fresh access token each run.
 
-    The refresh token itself is NOT rotated here — Microsoft will keep issuing
-    new access tokens from the same refresh token until it expires (~90 days
-    of inactivity) or is revoked.  Re-run generate_refresh_token.py before
-    the 90-day window to obtain a new refresh token.
+    Refresh tokens last ~90 days. Re-run generate_refresh_token.py before
+    expiry and update the OD_REFRESH_TOKEN GitHub Secret.
     """
     app = PublicClientApplication(
         OD_CLIENT_ID,
@@ -234,7 +227,7 @@ def get_onedrive_token() -> str:
     )
     result = app.acquire_token_by_refresh_token(
         OD_REFRESH_TOKEN,
-        scopes=["https://graph.microsoft.com/Files.ReadWrite"],
+        scopes=["https://graph.microsoft.com/.default"],
     )
     if "access_token" not in result:
         error_desc = result.get("error_description", str(result))
@@ -247,7 +240,7 @@ def get_onedrive_token() -> str:
     return result["access_token"]
 
 
-# ─── Folder resolution ─────────────────────────────────────────────────────────
+# ─── Folder resolution (mail) ──────────────────────────────────────────────────
 def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
     """
     Return the Graph API folder ID for a named subfolder inside the target mailbox.
@@ -259,12 +252,11 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
         return None
 
     headers = {"Authorization": f"Bearer {token}"}
-
     url = (
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/mailFolders"
         f"?$select=id,displayName&$top=50"
     )
-    resp = requests.get(url, headers=headers, timeout=15)
+    resp = requests.get(url, headers=headers, timeout=30)
     if not resp.ok:
         log.warning(f"resolve_folder_id: mailFolders fetch failed {resp.status_code}")
         return None
@@ -279,7 +271,7 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
             f"/mailFolders/{folder['id']}/childFolders"
             f"?$select=id,displayName&$top=50"
         )
-        child_resp = requests.get(child_url, headers=headers, timeout=15)
+        child_resp = requests.get(child_url, headers=headers, timeout=30)
         if not child_resp.ok:
             continue
         for child in child_resp.json().get("value", []):
@@ -327,7 +319,7 @@ def mark_email_read(token: str, message_id: str) -> None:
             f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages/{message_id}",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json={"isRead": True},
-            timeout=30,  # increased from 10
+            timeout=30,
         )
     except Exception as exc:
         log.warning(f"mark_email_read failed for {message_id}: {exc} — continuing")
@@ -419,9 +411,45 @@ def parse_html_table(html: str) -> list[dict]:
     return rows
 
 
-# ─── OneDrive attachment upload ────────────────────────────────────────────────
+# ─── OneDrive folder & attachment upload ───────────────────────────────────────
 def _is_resume(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in RESUME_EXTENSIONS
+
+
+def _ensure_onedrive_folder(od_token: str, folder_name: str) -> None:
+    """Create the target folder in OneDrive if it doesn't already exist."""
+    headers = {
+        "Authorization": f"Bearer {od_token}",
+        "Content-Type": "application/json",
+    }
+    # Check if folder already exists
+    check = requests.get(
+        f"https://graph.microsoft.com/v1.0/me/drive/root:/{folder_name}",
+        headers=headers,
+        timeout=30,
+    )
+    if check.status_code == 200:
+        log.info(f"OneDrive folder '{folder_name}' already exists.")
+        return
+
+    # Create it
+    resp = requests.post(
+        "https://graph.microsoft.com/v1.0/me/drive/root/children",
+        headers=headers,
+        json={
+            "name": folder_name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "rename",
+        },
+        timeout=30,
+    )
+    if resp.status_code in (200, 201):
+        log.info(f"Created OneDrive folder '{folder_name}'.")
+    else:
+        log.warning(
+            f"Could not create OneDrive folder '{folder_name}': "
+            f"{resp.status_code} — {resp.text[:200]}"
+        )
 
 
 def _fetch_attachment_content(mail_token: str, message_id: str, attachment_id: str) -> bytes:
@@ -438,13 +466,15 @@ def _fetch_attachment_content(mail_token: str, message_id: str, attachment_id: s
 def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optional[str]:
     """
     Upload a resume file to ONEDRIVE_USER's personal OneDrive using a
-    delegated access token (obtained via refresh token — no app-level
-    Files.ReadWrite.All permission required).
+    delegated access token. The HR Resumes folder is created by
+    _ensure_onedrive_folder() at startup so it always exists by the time
+    this function is called.
     """
-    remote_path = f"{ONEDRIVE_FOLDER}/{filename}"
+    if ONEDRIVE_FOLDER:
+        remote_path = f"{ONEDRIVE_FOLDER}/{filename}"
+    else:
+        remote_path = filename
 
-    # Use /me/drive when using a delegated token — this resolves to ONEDRIVE_USER
-    # because the token was issued on behalf of that user.
     upload_url = (
         f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/content"
     )
@@ -887,14 +917,16 @@ def process_emails() -> None:
     od_token = get_onedrive_token()
     log.info("Tokens obtained.")
 
-    # Verify OneDrive access — using /me/drive with the delegated token
+    # Verify OneDrive access and ensure target folder exists
     _drive_check = requests.get(
         "https://graph.microsoft.com/v1.0/me/drive",
         headers={"Authorization": f"Bearer {od_token}"},
-        timeout=30,  # increased from 10    
+        timeout=30,
     )
     if _drive_check.status_code == 200:
         log.info(f"OneDrive access confirmed for {ONEDRIVE_USER}.")
+        if ONEDRIVE_FOLDER:
+            _ensure_onedrive_folder(od_token, ONEDRIVE_FOLDER)
     else:
         log.warning(
             f"OneDrive access check returned {_drive_check.status_code} for "
@@ -965,7 +997,7 @@ def process_emails() -> None:
         email_updated  = email_conflicts = 0
 
         for row in rows:
-            row_date       = _parse_date(row["date"]) if row.get("date") else None
+            row_date = _parse_date(row["date"]) if row.get("date") else None
             if row_date is None:
                 row_date = date.today()
                 if row.get("date"):
@@ -1117,14 +1149,14 @@ def process_emails() -> None:
                 )
 
                 rows_summary.append({
-                    "name":              candidate_name or "(unknown)",
-                    "outcome":           "inserted" if ok else "error",
-                    "record_data":       new_record_data,
-                    "updated_fields":    [],
-                    "missing":           [f for f in _REQUIRED_FIELDS if not new_record_data.get(f)],
-                    "dup_flag":          "Duplicate Recruiter",
-                    "db_error":          None if ok else "DB insert failed — check extractor.log",
-                    "diff_recruiter":    diff_key.get("recruiter"),
+                    "name":           candidate_name or "(unknown)",
+                    "outcome":        "inserted" if ok else "error",
+                    "record_data":    new_record_data,
+                    "updated_fields": [],
+                    "missing":        [f for f in _REQUIRED_FIELDS if not new_record_data.get(f)],
+                    "dup_flag":       "Duplicate Recruiter",
+                    "db_error":       None if ok else "DB insert failed — check extractor.log",
+                    "diff_recruiter": diff_key.get("recruiter"),
                 })
                 continue
 
