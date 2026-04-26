@@ -11,13 +11,11 @@ Duplicate handling:
   2. Different recruiter + same candidate/JR → insert record immediately and
      send informational notification to both recruiters.
 
-FIX (2026-04-26):
-  - OneDrive uploads now use the mail token (AZURE_* credentials) instead of
-    the separate OD_* token. The OD app was returning 401 generalException
-    because Files.ReadWrite.All admin consent was not granted for that app.
-    The mail app token already has the necessary drive permissions.
-  - get_onedrive_token() is kept for backwards compatibility but is no longer
-    called in the main pipeline.
+OneDrive fix notes:
+  - Only .pdf / .doc / .docx attachments are uploaded
+  - Drive uploads use ONEDRIVE_USER (your personal email) instead of
+    TARGET_MAILBOX, since the OD app has access to your personal OneDrive.
+  - Requires Files.ReadWrite (Application) permission on the OD app in Azure.
 """
 
 import os
@@ -52,14 +50,17 @@ AZURE_TENANT_ID     = os.environ["AZURE_TENANT_ID"]
 AZURE_CLIENT_ID     = os.environ["AZURE_CLIENT_ID"]
 AZURE_CLIENT_SECRET = os.environ["AZURE_CLIENT_SECRET"]
 
-# OD credentials kept for backwards compatibility — no longer used in pipeline.
-# To re-enable the separate OD app, grant Files.ReadWrite.All + admin consent
-# in Azure Portal, then swap upload_attachments() back to use od_token.
-OD_TENANT_ID        = os.environ.get("OD_TENANT_ID", "")
-OD_CLIENT_ID        = os.environ.get("OD_CLIENT_ID", "")
-OD_CLIENT_SECRET    = os.environ.get("OD_CLIENT_SECRET", "")
+OD_TENANT_ID        = os.environ["OD_TENANT_ID"]
+OD_CLIENT_ID        = os.environ["OD_CLIENT_ID"]
+OD_CLIENT_SECRET    = os.environ["OD_CLIENT_SECRET"]
 
 TARGET_MAILBOX      = os.environ["TARGET_MAILBOX"]
+
+# Your personal email whose OneDrive the OD app has access to.
+# This is where resume attachments will be uploaded.
+# Add this to your .env: ONEDRIVE_USER=yourname@volibits.com
+ONEDRIVE_USER       = os.environ["ONEDRIVE_USER"]
+
 DB_DSN              = os.environ["DB_DSN"]
 DB_TABLE            = os.environ.get("DB_TABLE_NAME", "hrvolibit")
 ONEDRIVE_FOLDER     = os.environ.get("ONEDRIVE_FOLDER", "HR Resumes")
@@ -205,17 +206,6 @@ def get_mail_token() -> str:
 
 
 def get_onedrive_token() -> str:
-    """
-    Kept for backwards compatibility.
-    Only call this if OD_* env vars are set AND the OD Azure app has
-    Files.ReadWrite.All with admin consent granted.
-    The main pipeline now uses the mail token for OneDrive uploads.
-    """
-    if not all([OD_TENANT_ID, OD_CLIENT_ID, OD_CLIENT_SECRET]):
-        raise RuntimeError(
-            "OD_TENANT_ID / OD_CLIENT_ID / OD_CLIENT_SECRET are not set. "
-            "Use get_mail_token() for OneDrive operations instead."
-        )
     return _get_token(OD_TENANT_ID, OD_CLIENT_ID, OD_CLIENT_SECRET)
 
 
@@ -393,38 +383,41 @@ def _is_resume(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in RESUME_EXTENSIONS
 
 
-def _fetch_attachment_content(token: str, message_id: str, attachment_id: str) -> bytes:
-    """Download raw attachment bytes from the mail API."""
+def _fetch_attachment_content(mail_token: str, message_id: str, attachment_id: str) -> bytes:
+    """
+    Download raw attachment bytes using the mail token and TARGET_MAILBOX.
+    Mail reading always uses TARGET_MAILBOX — unchanged from original.
+    """
     url = (
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
         f"/messages/{message_id}/attachments/{attachment_id}/$value"
     )
-    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+    resp = requests.get(url, headers={"Authorization": f"Bearer {mail_token}"}, timeout=60)
     resp.raise_for_status()
     return resp.content
 
 
-def _upload_to_onedrive(token: str, filename: str, content: bytes) -> Optional[str]:
+def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optional[str]:
     """
-    Upload a file to OneDrive using the provided token.
+    Upload a resume file to OneDrive.
 
-    FIX: This now accepts any valid Graph API token. The caller (upload_attachments)
-    passes the mail token (AZURE_* credentials) which already has drive access,
-    resolving the 401 generalException that occurred when using the OD_* token
-    without Files.ReadWrite.All admin consent.
-
-    Uses /users/{mailbox}/drive so the file lands in the mailbox owner's OneDrive,
-    which is the same drive the mail app has access to.
+    FIX: Uses ONEDRIVE_USER (your personal email) instead of TARGET_MAILBOX.
+    The OD app has Files.ReadWrite access to your personal OneDrive —
+    that is why uploads worked before and why pointing to TARGET_MAILBOX
+    caused the 401 error (the OD app has no access to that mailbox's drive).
     """
     remote_path = f"{ONEDRIVE_FOLDER}/{filename}"
+
+    # FIX: ONEDRIVE_USER instead of TARGET_MAILBOX
     upload_url = (
-        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
+        f"https://graph.microsoft.com/v1.0/users/{ONEDRIVE_USER}"
         f"/drive/root:/{remote_path}:/content"
     )
+
     resp = requests.put(
         upload_url,
         headers={
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {od_token}",
             "Content-Type": "application/octet-stream",
         },
         data=content,
@@ -440,12 +433,13 @@ def _upload_to_onedrive(token: str, filename: str, content: bytes) -> Optional[s
     item    = resp.json()
     item_id = item.get("id")
 
-    # Try to create a shareable link
+    # Create a shareable link for the uploaded file
+    # FIX: Also uses ONEDRIVE_USER here for the createLink call
     link_resp = requests.post(
-        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
+        f"https://graph.microsoft.com/v1.0/users/{ONEDRIVE_USER}"
         f"/drive/items/{item_id}/createLink",
         headers={
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {od_token}",
             "Content-Type": "application/json",
         },
         json={"type": "view", "scope": "organization"},
@@ -466,17 +460,10 @@ def _upload_to_onedrive(token: str, filename: str, content: bytes) -> Optional[s
     return None
 
 
-def upload_attachments(mail_token: str, msg: dict) -> str:
+def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
     """
-    Download resume attachments from the email and upload them to OneDrive.
-
-    FIX: Signature changed — od_token parameter removed. Both the attachment
-    download and the OneDrive upload now use the same mail_token, which already
-    has the necessary Graph API permissions (Mail.Read + Files.ReadWrite.All
-    on the mailbox owner's drive).
-
-    Old signature: upload_attachments(od_token, mail_token, msg)
-    New signature: upload_attachments(mail_token, msg)
+    Download resume attachments from email (mail_token + TARGET_MAILBOX)
+    and upload them to OneDrive (od_token + ONEDRIVE_USER).
     """
     attachments = msg.get("attachments") or []
     if not attachments:
@@ -494,7 +481,7 @@ def upload_attachments(mail_token: str, msg: dict) -> str:
             continue
         try:
             content = _fetch_attachment_content(mail_token, msg["id"], att_id)
-            link    = _upload_to_onedrive(mail_token, filename, content)
+            link    = _upload_to_onedrive(od_token, filename, content)
             links.append(link if link else filename)
         except Exception as exc:
             log.error(f"Failed to upload {filename!r}: {exc}")
@@ -505,7 +492,6 @@ def upload_attachments(mail_token: str, msg: dict) -> str:
 
 # ─── DB schema helpers ─────────────────────────────────────────────────────────────
 def ensure_tables(cur) -> None:
-    """Create ancillary tables if they don't exist yet."""
     cur.execute("""
         CREATE TABLE IF NOT EXISTS hr_processed_emails (
             message_id    TEXT PRIMARY KEY,
@@ -859,28 +845,28 @@ def _parse_date(raw: str) -> Optional[date]:
 # ─── Main pipeline ────────────────────────────────────────────────────────────────
 def process_emails() -> None:
     log.info("=== HR Email Extractor starting ===")
-    log.info(f"Target table   : {DB_TABLE}")
+    log.info(f"Target mailbox : {TARGET_MAILBOX}")
+    log.info(f"OneDrive user  : {ONEDRIVE_USER}")
     log.info(f"OneDrive folder: {ONEDRIVE_FOLDER}")
     log.info(f"Inbox subfolder: {INBOX_SUBFOLDER or '(root inbox)'}")
 
-    # FIX: Only one token needed — the mail token is used for both
-    # mail operations and OneDrive uploads.
-    token = get_mail_token()
-    log.info("Mail token obtained.")
+    token    = get_mail_token()
+    od_token = get_onedrive_token()
+    log.info("Tokens obtained.")
 
-    # Optional: verify drive access before processing emails
+    # Verify OneDrive access against ONEDRIVE_USER at startup
     _drive_check = requests.get(
-        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/drive",
-        headers={"Authorization": f"Bearer {token}"},
+        f"https://graph.microsoft.com/v1.0/users/{ONEDRIVE_USER}/drive",
+        headers={"Authorization": f"Bearer {od_token}"},
         timeout=10,
     )
     if _drive_check.status_code == 200:
-        log.info("OneDrive access confirmed via mail token.")
+        log.info(f"OneDrive access confirmed for {ONEDRIVE_USER}.")
     else:
         log.warning(
-            f"OneDrive access check returned {_drive_check.status_code} — "
-            f"attachment uploads may fail. "
-            f"Ensure Files.ReadWrite.All is granted to the AZURE app in Azure Portal."
+            f"OneDrive access check returned {_drive_check.status_code} for "
+            f"{ONEDRIVE_USER} — attachment uploads may fail. "
+            f"Response: {_drive_check.text[:200]}"
         )
 
     inbox_folder_id = resolve_folder_id(token, INBOX_SUBFOLDER) if INBOX_SUBFOLDER else None
@@ -923,8 +909,9 @@ def process_emails() -> None:
         client_recruiter = _username_from_email(to_addr)
         delivery_type    = _delivery_type(from_addr, to_addr)
 
-        # FIX: Pass only mail_token — no separate od_token needed.
-        attachment_str = upload_attachments(token, msg)
+        # mail_token reads attachments from TARGET_MAILBOX
+        # od_token uploads files to ONEDRIVE_USER's personal drive
+        attachment_str = upload_attachments(od_token, token, msg)
 
         body_html = (msg.get("body") or {}).get("content", "")
         rows      = parse_html_table(body_html)
@@ -1208,7 +1195,6 @@ def process_emails() -> None:
                     "db_error":       "DB insert failed — check extractor.log",
                 })
 
-        # Determine overall outcome label for the audit log
         if email_errors > 0 and email_inserted == 0 and email_updated == 0:
             _outcome = "all_failed"
         elif email_errors > 0:
