@@ -322,12 +322,15 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
 
 
 def mark_email_read(token: str, message_id: str) -> None:
-    requests.patch(
-        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages/{message_id}",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={"isRead": True},
-        timeout=10,
-    )
+    try:
+        requests.patch(
+            f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages/{message_id}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"isRead": True},
+            timeout=30,  # increased from 10
+        )
+    except Exception as exc:
+        log.warning(f"mark_email_read failed for {message_id}: {exc} — continuing")
 
 
 # ─── Subject parsing ───────────────────────────────────────────────────────────
@@ -888,7 +891,7 @@ def process_emails() -> None:
     _drive_check = requests.get(
         "https://graph.microsoft.com/v1.0/me/drive",
         headers={"Authorization": f"Bearer {od_token}"},
-        timeout=10,
+        timeout=30,  # increased from 10    
     )
     if _drive_check.status_code == 200:
         log.info(f"OneDrive access confirmed for {ONEDRIVE_USER}.")
