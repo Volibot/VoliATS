@@ -640,7 +640,7 @@ def run() -> None:
             else "External"
         )
 
-        attachment_str = get_attachment_names(mail_token, msg)
+        attachment_str = upload_attachments(od_token, token, msg)
 
         body_html = (msg.get("body") or {}).get("content", "")
         rows      = parse_html_table(body_html)
