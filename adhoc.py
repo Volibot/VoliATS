@@ -78,7 +78,7 @@ OD_REFRESH_TOKEN    = os.environ["OD_REFRESH_TOKEN"]
 ONEDRIVE_USER       = os.environ["ONEDRIVE_USER"]
 DB_DSN              = os.environ["DB_DSN"]
 DB_TABLE            = os.environ.get("DB_TABLE_NAME", "temp_hrvolibit_archive")
-ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "Archive")
+ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "archive")
 Limit               = int(os.environ.get("LIMIT", "100"))
 
 COMPANY_CODES: dict[str, str] = {
