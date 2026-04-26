@@ -330,14 +330,22 @@ SUBJECT_RE = re.compile(r"^(?P<code>[A-Z]{2,5})\s*:\s*(?P<rest>.+)$", re.IGNOREC
 IGNORE_RE  = re.compile(r"^(fw|fwd|re|aw)\s*:", re.IGNORECASE)
 
 _JR_PATTERNS = [
-    re.compile(r"[-|]\s*(?:jr\s*)?(?P<jr>\d{4,})\s*$",   re.IGNORECASE),
-    re.compile(r"^\s*(?:jr\s*)?(?P<jr>\d{4,})\s*[-|]",   re.IGNORECASE),
-    re.compile(r"\(\s*jr\s*(?P<jr>\d{4,})\s*\)",          re.IGNORECASE),
-    re.compile(r"\(\s*(?P<jr>\d{4,})\s*\)",               re.IGNORECASE),
-    re.compile(r"\bjr\s*(?P<jr>\d{4,})\b",                re.IGNORECASE),
-    re.compile(r"\b(?P<jr>\d{4,})\b",                     re.IGNORECASE),
+    re.compile(r"[-|]\s*(?:jr\s*(?:no\.?\s*)?)(?P<jr>\d{4,})\s*$",   re.IGNORECASE),
+    re.compile(r"^\s*(?:jr\s*(?:no\.?\s*)?)(?P<jr>\d{4,})\s*[-|]",   re.IGNORECASE),
+    re.compile(r"[-|]\s*(?P<jr>\d{4,})\s*$",                          re.IGNORECASE),
+    re.compile(r"^\s*(?P<jr>\d{4,})\s*[-|]",                          re.IGNORECASE),
+    re.compile(r"\(\s*jr\s*(?:no\.?\s*)?(?P<jr>\d{4,})\s*\)",         re.IGNORECASE),
+    re.compile(r"\(\s*(?P<jr>\d{4,})\s*\)",                            re.IGNORECASE),
+    re.compile(r"\bjr\s*(?:no\.?\s*)?(?P<jr>\d{4,})\b",               re.IGNORECASE),
+    re.compile(r"\b(?P<jr>\d{4,})\b",                                  re.IGNORECASE),
 ]
 
+# Filler phrases that add no skill info and should be stripped out
+_SKILL_FILLER_RE = re.compile(
+    r"\b(profile\s+for\s+(the\s+)?|profile\s+of\s+(the\s+)?|cv\s+for\s+(the\s+)?"
+    r"|resume\s+for\s+(the\s+)?|candidate\s+for\s+(the\s+)?)\b",
+    re.IGNORECASE,
+)
 
 def _extract_jr_and_skill(rest: str) -> tuple[Optional[str], str]:
     rest = rest.strip()
@@ -348,8 +356,11 @@ def _extract_jr_and_skill(rest: str) -> tuple[Optional[str], str]:
             jr_no = m.group("jr")
             start, end = m.span()
             rest = (rest[:start] + " " + rest[end:]).strip()
-            rest = re.sub(r"^[-|\s]+|[-|\s]+$", "", rest).strip()
+            rest = re.sub(r"^[-|.\s]+|[-|.\s]+$", "", rest).strip()
             break
+    # Strip filler phrases like "Profile for the", "CV for the", etc.
+    rest = _SKILL_FILLER_RE.sub("", rest).strip()
+    rest = re.sub(r"^[-|.\s]+|[-|.\s]+$", "", rest).strip()
     return jr_no, re.sub(r"\s{2,}", " ", rest).strip()
 
 
