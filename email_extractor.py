@@ -330,35 +330,50 @@ SUBJECT_RE = re.compile(r"^(?P<code>[A-Z]{2,5})\s*:\s*(?P<rest>.+)$", re.IGNOREC
 IGNORE_RE  = re.compile(r"^(fw|fwd|re|aw)\s*:", re.IGNORECASE)
 
 _JR_PATTERNS = [
-    re.compile(r"[-|]\s*(?:jr\s*(?:no\.?\s*)?)(?P<jr>\d{4,})\s*$",   re.IGNORECASE),
-    re.compile(r"^\s*(?:jr\s*(?:no\.?\s*)?)(?P<jr>\d{4,})\s*[-|]",   re.IGNORECASE),
-    re.compile(r"[-|]\s*(?P<jr>\d{4,})\s*$",                          re.IGNORECASE),
-    re.compile(r"^\s*(?P<jr>\d{4,})\s*[-|]",                          re.IGNORECASE),
-    re.compile(r"\(\s*jr\s*(?:no\.?\s*)?(?P<jr>\d{4,})\s*\)",         re.IGNORECASE),
-    re.compile(r"\(\s*(?P<jr>\d{4,})\s*\)",                            re.IGNORECASE),
-    re.compile(r"\bjr\s*(?:no\.?\s*)?(?P<jr>\d{4,})\b",               re.IGNORECASE),
-    re.compile(r"\b(?P<jr>\d{4,})\b",                                  re.IGNORECASE),
+    re.compile(r"[-|]\s*(?:jr\.?\s*(?:no\.?\s*)?)(?P<jr>\d{4,})\s*$",   re.IGNORECASE),
+    re.compile(r"^\s*(?:jr\.?\s*(?:no\.?\s*)?)(?P<jr>\d{4,})\s*[-|]",   re.IGNORECASE),
+    re.compile(r"[-|]\s*(?P<jr>\d{4,})\s*$",                              re.IGNORECASE),
+    re.compile(r"^\s*(?P<jr>\d{4,})\s*[-|]",                              re.IGNORECASE),
+    re.compile(r"\(\s*jr\.?\s*(?:no\.?\s*)?(?P<jr>\d{4,})\s*\)",          re.IGNORECASE),
+    re.compile(r"\(\s*(?P<jr>\d{4,})\s*\)",                                re.IGNORECASE),
+    re.compile(r"\bjr\.?\s*(?:no\.?\s*)?(?P<jr>\d{4,})\b",                re.IGNORECASE),
+    re.compile(r"\b(?P<jr>\d{4,})\b",                                      re.IGNORECASE),
 ]
 
-# Filler phrases that add no skill info and should be stripped out
+# Leftover "Jr." / "Jr. No." stub after the number has been extracted
+_JR_STUB_RE = re.compile(r"\bjr\.?\s*(?:no\.?)?\s*$", re.IGNORECASE)
+
+# Filler phrases: "Profile(s) for [the]", "Profiles of [the]",
+#                 "Sharing profile", "CV for [the]", "Resume for [the]", etc.
 _SKILL_FILLER_RE = re.compile(
-    r"\b(profile\s+for\s+(the\s+)?|profile\s+of\s+(the\s+)?|cv\s+for\s+(the\s+)?"
-    r"|resume\s+for\s+(the\s+)?|candidate\s+for\s+(the\s+)?)\b",
+    r"\b(?:profiles?\s+for\s+(?:the\s+)?"
+    r"|profiles?\s+of\s+(?:the\s+)?"
+    r"|sharing\s+profiles?\s+for\s+(?:the\s+)?"
+    r"|sharing\s+profiles?\s*"
+    r"|cv\s+for\s+(?:the\s+)?"
+    r"|resume\s+for\s+(?:the\s+)?"
+    r"|candidate\s+for\s+(?:the\s+)?)",
     re.IGNORECASE,
 )
+
 
 def _extract_jr_and_skill(rest: str) -> tuple[Optional[str], str]:
     rest = rest.strip()
     jr_no: Optional[str] = None
+
     for pattern in _JR_PATTERNS:
         m = pattern.search(rest)
         if m:
             jr_no = m.group("jr")
             start, end = m.span()
             rest = (rest[:start] + " " + rest[end:]).strip()
+            # Remove separators and bare "Jr."/"Jr. No." stubs left behind
             rest = re.sub(r"^[-|.\s]+|[-|.\s]+$", "", rest).strip()
+            rest = _JR_STUB_RE.sub("", rest).strip()
+            rest = re.sub(r"[-|.\s]+$", "", rest).strip()
             break
-    # Strip filler phrases like "Profile for the", "CV for the", etc.
+
+    # Strip filler phrases, then clean up remaining separators
     rest = _SKILL_FILLER_RE.sub("", rest).strip()
     rest = re.sub(r"^[-|.\s]+|[-|.\s]+$", "", rest).strip()
     return jr_no, re.sub(r"\s{2,}", " ", rest).strip()
