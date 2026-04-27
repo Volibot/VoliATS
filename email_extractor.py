@@ -125,11 +125,11 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "current_org": [
         "current company", "current_company", "company", "employer",
         "current employer", "current_employer", "current org", "current_org",
-        "organisation", "organization", "curr company", "present company",
+        "organisation", "organization", "curr company", "present company", "curr org"
     ],
     "total_experience": [
         "total experience", "total_experience", "total exp", "total_exp",
-        "experience", "exp", "total yrs", "total years",
+        "experience", "exp", "total yrs", "total years", "tot exp"
     ],
     "relevant_experience": [
         "relevant experience", "relevant_experience", "relevant exp",
@@ -149,12 +149,12 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     ],
     "current_location": [
         "current location", "current_location", "location", "city",
-        "current city", "current_city", "present location",
+        "current city", "current_city", "present location", "curr loc",
     ],
     "preferred_location": [
         "preferred location", "preferred_location", "preferred city",
         "preferred_city", "pref location", "pref_location",
-        "willing to relocate", "target location",
+        "willing to relocate", "target location", "exc loc"
     ],
     "date": [
         "date", "submission date", "submission_date", "applied date",
