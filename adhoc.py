@@ -527,7 +527,7 @@ SKIP_SUBJECT_RE = re.compile(
     r"\b(undelivered|undeliverable|delivery\s+failed|delivery\s+status"
     r"|delivery\s+notification|mail\s+delivery|returned\s+mail"
     r"|non[- ]?deliverable|bounced?|failed\s+delivery"
-    r"|delivered)\b",
+    r"|delivered|reminder)\b",
     re.IGNORECASE,
 )
 
@@ -559,7 +559,9 @@ _SKILL_FILLER_RE = re.compile(
     r"|sharing\s+profiles?\s*"
     r"|cv\s+for\s+(?:the\s+)?"
     r"|resume\s+for\s+(?:the\s+)?"
-    r"|candidate\s+for\s+(?:the\s+)?)",
+    r"|candidate\s+for\s+(?:the\s+)?"
+    r"| \|\| \|\| .*"
+    r")",
     re.IGNORECASE,
 )
 
@@ -1035,9 +1037,8 @@ def run() -> None:
 
             effective_jr_no = _t(row.get("jr_no")) or subject_jr_no
             candidate_name  = _t(row.get("name_of_candidate"))
-            # Sanitise: contact_number → digits only; email_id → valid email only
-            contact_number  = _sanitize_contact(_t(row.get("contact_number")))
-            email_id_val    = _sanitize_email(_t(row.get("email_id")))
+            raw_contact = _t(row.get("contact_number"))
+            raw_email   = _t(row.get("email_id"))
 
             record = {
                 "email_subject":       subject,
@@ -1051,8 +1052,8 @@ def run() -> None:
                 "date":                row_date,
                 "jr_no":               effective_jr_no,
                 "name_of_candidate":   candidate_name,
-                "contact_number":      contact_number,
-                "email_id":            email_id_val,
+                "contact_number":      raw_contact,
+                "email_id":            raw_email,
                 "total_experience":    _t(row.get("total_experience")),
                 "relevant_experience": _t(row.get("relevant_experience")),
                 "current_ctc":         _t(row.get("current_ctc")),
@@ -1065,8 +1066,11 @@ def run() -> None:
                 "remarks":             _t(row.get("remarks")),
             }
 
-            # ── Fix swapped contact/email fields before status check ───────
+            # ── Fix swapped contact/email fields before sanitisation ───────
             record = _fix_swapped_contact_email(record)
+
+            record["contact_number"] = _sanitize_contact(_t(record.get("contact_number")))
+            record["email_id"]       = _sanitize_email(_t(record.get("email_id")))
 
             record["record_status"] = _record_status({
                 "name_of_candidate": record.get("name_of_candidate"),

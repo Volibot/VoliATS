@@ -402,7 +402,9 @@ _SKILL_FILLER_RE = re.compile(
     r"|sharing\s+profiles?\s*"
     r"|cv\s+for\s+(?:the\s+)?"
     r"|resume\s+for\s+(?:the\s+)?"
-    r"|candidate\s+for\s+(?:the\s+)?)",
+    r"|candidate\s+for\s+(?:the\s+)?"
+    r"| \|\| \|\| .*"
+    r")",
     re.IGNORECASE,
 )
 
