@@ -145,8 +145,7 @@ EXCEL_COLUMNS = [
     "name_of_candidate", "contact_number", "email_id",
     "total_experience", "relevant_experience",
     "current_ctc", "expected_ctc", "notice_period",
-    "current_org", "current_location", "preferred_location",
-    "qualification", "attachment", "remarks", "record_status",
+    "current_org", "current_location", "preferred_location", "attachment", "remarks", "record_status",
     "ai_extracted",
 ]
 
@@ -231,11 +230,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "willing to relocate", "target location", "pref_loc",
         "pre location", "current/preferred location", "pref location",
     ],
-    "qualification": [
-        "qualification", "qualifications", "education", "degree",
-        "educational qualification", "highest qualification",
-        "academic qualification", "edu", "qual",
-    ],
+
     "date": [
         "date", "submission date", "submission_date", "applied date",
         "applied_date", "profile date", "date of submission",
@@ -286,7 +281,6 @@ Return ONLY a valid JSON array (no markdown, no explanation). Each element is a 
 - current_org
 - current_location
 - preferred_location
-- qualification
 - remarks
 
 Email body:
@@ -371,7 +365,7 @@ def _headers_make_sense(col_map: dict) -> bool:
         "name_of_candidate", "contact_number", "email_id",
         "total_experience", "relevant_experience", "current_ctc",
         "expected_ctc", "notice_period", "current_org",
-        "current_location", "preferred_location", "qualification",
+        "current_location", "preferred_location",
     }
     mapped = set(col_map.values()) & candidate_fields
     return len(mapped) >= 3
@@ -833,8 +827,7 @@ COL_WIDTHS = {
     "name_of_candidate": 22, "contact_number": 16, "email_id": 28,
     "total_experience": 14, "relevant_experience": 16,
     "current_ctc": 14, "expected_ctc": 14, "notice_period": 14,
-    "current_org": 22, "current_location": 18, "preferred_location": 18,
-    "qualification": 18, "attachment": 35, "remarks": 30,
+    "current_org": 22, "current_location": 18, "preferred_location": 18, "attachment": 35, "remarks": 30,
     "record_status": 14, "ai_extracted": 12,
 }
 
@@ -849,7 +842,7 @@ PRETTY_HEADERS = {
     "relevant_experience": "Relevant Exp", "current_ctc": "Current CTC",
     "expected_ctc": "Expected CTC", "notice_period": "Notice Period",
     "current_org": "Current Org", "current_location": "Current Location",
-    "preferred_location": "Preferred Location", "qualification": "Qualification",
+    "preferred_location": "Preferred Location",
     "attachment": "Attachment", "remarks": "Remarks",
     "record_status": "Record Status", "ai_extracted": "AI Extracted",
 }
@@ -934,7 +927,6 @@ def _build_record(
         "current_org":         _t(row.get("current_org")),
         "current_location":    _t(row.get("current_location")),
         "preferred_location":  _t(row.get("preferred_location")),
-        "qualification":       _t(row.get("qualification")),
         "attachment":          _t(attachment_str),
         "remarks":             _t(row.get("remarks")),
         "ai_extracted":        "Yes" if ai_extracted else "No",
