@@ -90,7 +90,7 @@ DB_DSN                  = os.environ["DB_DSN"]
 
 # Schema + table always explicit — never rely on search_path
 DB_SCHEMA = os.environ.get("DB_SCHEMA", "public")
-DB_TABLE  = os.environ.get("temp_hrvolibit_archive")
+DB_TABLE  = "temp_hrvolibit_archive"
 
 ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "archive")
 LIMIT                   = int(os.environ.get("LIMIT", "100"))
