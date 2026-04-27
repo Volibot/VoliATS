@@ -49,6 +49,7 @@ Optional:
 
 import os
 import re
+import html as html_lib
 import logging
 import requests
 import psycopg2
@@ -88,14 +89,12 @@ OD_REFRESH_TOKEN        = os.environ["OD_REFRESH_TOKEN"]
 ONEDRIVE_USER           = os.environ["ONEDRIVE_USER"]
 DB_DSN                  = os.environ["DB_DSN"]
 
-# Schema + table always explicit — never rely on search_path
 DB_SCHEMA = os.environ.get("DB_SCHEMA", "public")
 DB_TABLE  = "temp_hrvolibit_archive"
 
 ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "archive")
 LIMIT                   = int(os.environ.get("LIMIT", "100"))
 
-# Set SKIP_UPLOADS=true to skip OneDrive uploads (faster catch-up runs)
 SKIP_UPLOADS = os.environ.get("SKIP_UPLOADS", "false")
 
 COMPANY_CODES: dict[str, str] = {
@@ -129,9 +128,6 @@ EXCEL_COLUMNS = [
     "attachment", "remarks", "record_status",
 ]
 
-# ── DB columns — must exactly match public.temp_hrvolibit_archive ─────────────
-# Excludes auto-managed columns: id, created_date, modified_date,
-# created_by, modified_by, is_duplicate, final_status, status
 DB_COLUMNS = [
     "email_subject",
     "recruiter",
@@ -564,10 +560,83 @@ def parse_subject(subject: str) -> Optional[tuple[str, str, str, Optional[str]]]
 
 # ── HTML table parser ──────────────────────────────────────────────────────────
 def _strip_html(text: str) -> str:
+    """Remove all HTML tags."""
     return re.sub(r"<[^>]+>", "", text)
 
 def _clean_cell(text: str) -> str:
-    return re.sub(r"\s+", " ", _strip_html(text)).strip()
+    """
+    Strip HTML tags, decode HTML entities (e.g. &nbsp; → space),
+    then collapse whitespace.
+    """
+    # 1. Decode HTML entities first (&nbsp; &amp; &lt; etc.)
+    text = html_lib.unescape(text)
+    # 2. Remove any remaining HTML tags
+    text = _strip_html(text)
+    # 3. Replace non-breaking spaces (U+00A0) with regular spaces
+    text = text.replace("\u00a0", " ")
+    # 4. Collapse all whitespace to a single space and strip
+    return re.sub(r"\s+", " ", text).strip()
+
+# ── Value type detectors ───────────────────────────────────────────────────────
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_PHONE_RE = re.compile(r"^[\d\s\-\+\(\)]{7,15}$")
+
+def _looks_like_email(val: str) -> bool:
+    return bool(val and _EMAIL_RE.match(val.strip()))
+
+def _looks_like_phone(val: str) -> bool:
+    """True if the value is all digits/spaces/dashes with no @ sign."""
+    return bool(val and _PHONE_RE.match(val.strip()) and "@" not in val)
+
+def _fix_swapped_contact_email(record: dict) -> dict:
+    """
+    Detect and correct the common case where email ends up in contact_number
+    and a phone number ends up in email_id — caused by ambiguous column headers
+    or column-order mismatches in the source HTML table.
+
+    Cases handled:
+      1. email in contact_number + phone in email_id  → swap both
+      2. email in contact_number + email_id empty     → move to email_id, clear contact_number
+      3. phone in email_id + contact_number empty     → move to contact_number, clear email_id
+    """
+    contact = (record.get("contact_number") or "").strip()
+    email   = (record.get("email_id") or "").strip()
+
+    contact_is_email = _looks_like_email(contact)
+    contact_is_phone = _looks_like_phone(contact)
+    email_is_phone   = _looks_like_phone(email)
+    email_is_email   = _looks_like_email(email)
+
+    # Case 1: both fields contain the wrong type — swap them
+    if contact_is_email and email_is_phone:
+        log.warning(
+            f"Swapped contact/email detected — fixing: "
+            f"contact_number={contact!r}, email_id={email!r}"
+        )
+        record["contact_number"] = email
+        record["email_id"]       = contact
+        return record
+
+    # Case 2: email in contact_number, email_id is blank
+    if contact_is_email and not email:
+        log.warning(
+            f"Email found in contact_number with blank email_id — moving: {contact!r}"
+        )
+        record["email_id"]       = contact
+        record["contact_number"] = None
+        return record
+
+    # Case 3: phone in email_id, contact_number is blank
+    if email_is_phone and not contact:
+        log.warning(
+            f"Phone found in email_id with blank contact_number — moving: {email!r}"
+        )
+        record["contact_number"] = email
+        record["email_id"]       = None
+        return record
+
+    return record
+
 
 def parse_html_table(html: str) -> list[dict]:
     rows: list[dict] = []
@@ -633,11 +702,6 @@ def _t(val) -> Optional[str]:
 
 # ── Database helpers ───────────────────────────────────────────────────────────
 def _make_insert_sql() -> pgsql.Composed:
-    """
-    Schema-qualified INSERT — always targets DB_SCHEMA.DB_TABLE regardless
-    of the DB user's search_path. This was the root cause of the original
-    'column does not exist' error (wrong table being resolved).
-    """
     return pgsql.SQL(
         "INSERT INTO {schema}.{table} ({fields}) VALUES ({placeholders})"
     ).format(
@@ -649,11 +713,6 @@ def _make_insert_sql() -> pgsql.Composed:
 
 
 def _verify_table_columns(conn) -> None:
-    """
-    Pre-flight check: confirm every column in DB_COLUMNS exists in the
-    actual table. Fails fast with a clear message instead of spamming
-    per-row errors throughout the run.
-    """
     query = """
         SELECT column_name
         FROM information_schema.columns
@@ -685,11 +744,6 @@ def _verify_table_columns(conn) -> None:
 
 
 def insert_records_incremental(conn, records: list[dict]) -> int:
-    """
-    Insert records row-by-row using an already-open connection.
-    Commits after each successful row — a failed row is rolled back
-    individually so the rest continue inserting.
-    """
     insert_sql = _make_insert_sql()
     inserted = 0
     for rec in records:
@@ -790,7 +844,6 @@ def run() -> None:
     od_token   = get_onedrive_token()
     log.info("Tokens obtained.")
 
-    # OneDrive check (skipped when SKIP_UPLOADS=true)
     if not SKIP_UPLOADS:
         _drive_check = requests.get(
             "https://graph.microsoft.com/v1.0/me/drive",
@@ -809,10 +862,6 @@ def run() -> None:
     else:
         log.info("Skipping OneDrive drive check (SKIP_UPLOADS=true).")
 
-    # ── Open DB connection and run pre-flight column check ─────────────────
-    # _verify_table_columns exits immediately with a clear error if any
-    # column in DB_COLUMNS is missing from the real table — catching schema
-    # mismatches before any emails are processed.
     try:
         db_conn = psycopg2.connect(DB_DSN)
         db_conn.autocommit = False
@@ -904,24 +953,26 @@ def run() -> None:
                 "preferred_location":  _t(row.get("preferred_location")),
                 "attachment":          _t(attachment_str),
                 "remarks":             _t(row.get("remarks")),
-                "record_status":       _record_status({
-                    "name_of_candidate": candidate_name,
-                    "contact_number":    contact_number,
-                    "email_id":          email_id_val,
-                    "general_skill":     _t(general_skill),
-                    "company_name":      company_name,
-                    "recruiter":         recruiter,
-                    "email_from":        from_addr,
-                    "email_to":          to_addr,
-                }),
             }
+
+            # ── Fix swapped contact/email fields before status check ───────
+            record = _fix_swapped_contact_email(record)
+
+            record["record_status"] = _record_status({
+                "name_of_candidate": record.get("name_of_candidate"),
+                "contact_number":    record.get("contact_number"),
+                "email_id":          record.get("email_id"),
+                "general_skill":     _t(general_skill),
+                "company_name":      company_name,
+                "recruiter":         recruiter,
+                "email_from":        from_addr,
+                "email_to":          to_addr,
+            })
+
             records.append(record)
             email_records.append(record)
             log.info(f"  + {candidate_name or '(unknown)'} | {subject!r} | {row_date}")
 
-        # ── Commit this email's rows immediately ───────────────────────────
-        # Progress is saved after every email. A mid-run cancellation will
-        # never lose rows that have already been processed.
         if email_records and db_conn is not None:
             n = insert_records_incremental(db_conn, email_records)
             db_count += n
@@ -930,7 +981,6 @@ def run() -> None:
                 f"(running total: {db_count})"
             )
 
-    # ── Close DB connection ────────────────────────────────────────────────
     if db_conn is not None:
         try:
             db_conn.close()
@@ -946,7 +996,6 @@ def run() -> None:
         log.warning("No matching records found. Nothing to write.")
         return
 
-    # ── Write Excel ────────────────────────────────────────────────────────
     ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = f"adhoc_candidates_{ts}.xlsx"
     write_excel(records, output_path)
