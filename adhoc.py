@@ -24,6 +24,7 @@ Optional:
   DB_TABLE_NAME         (default: "temp_hrvolibit_archive")
   ONEDRIVE_ARCHIVE_FOLDER (default: "archive")
   LIMIT                 (default: 100)
+  SKIP_UPLOADS          (default: false — set to "true" to skip OneDrive uploads)
 
 ── Local run ────────────────────────────────────────────────────────────────────
 1. Install dependencies:
@@ -89,6 +90,9 @@ DB_DSN                  = os.environ["DB_DSN"]
 DB_TABLE                = "temp_hrvolibit_archive"
 ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "archive")
 LIMIT                   = int(os.environ.get("LIMIT", "100"))
+
+# Set SKIP_UPLOADS=true in env to bypass OneDrive uploads (useful for catch-up runs)
+SKIP_UPLOADS = os.environ.get("SKIP_UPLOADS", "false")
 
 COMPANY_CODES: dict[str, str] = {
     "BS":  "Birlasoft",
@@ -225,6 +229,7 @@ ALIAS_MAP: dict[str, str] = {
 def _resolve_header(raw: str) -> Optional[str]:
     return ALIAS_MAP.get(_normalize(raw))
 
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 def _get_app_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     result = ConfidentialClientApplication(
@@ -309,7 +314,7 @@ def fetch_bs_emails(token: str, folder_id: Optional[str]) -> list[dict]:
 
     url = (
         f"{base}"
-        f"?$top=50"  # reduced page size to avoid gateway timeouts
+        f"?$top=50"
         f"&$select=id,subject,from,toRecipients,body,receivedDateTime,hasAttachments"
         f"&$filter=receivedDateTime ge {since_iso}"
         f"&$orderby=receivedDateTime asc"
@@ -353,7 +358,7 @@ def _fetch_attachment_content(mail_token: str, message_id: str, attachment_id: s
     resp = requests.get(
         url,
         headers={"Authorization": f"Bearer {mail_token}"},
-        timeout=120,  # large attachments can be slow
+        timeout=120,
     )
     resp.raise_for_status()
     return resp.content
@@ -448,8 +453,12 @@ def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
     """
     Fetch resume attachments from the email, upload to OneDrive, return
     a comma-separated string of share links (or filenames on failure).
-    Returns "" if the email has no attachments.
+    Returns "" if the email has no attachments or SKIP_UPLOADS is set.
     """
+    if SKIP_UPLOADS:
+        log.debug("SKIP_UPLOADS=true — skipping attachment upload.")
+        return ""
+
     if not msg.get("hasAttachments"):
         return ""
 
@@ -598,7 +607,7 @@ def _t(val) -> Optional[str]:
     return v or None
 
 
-# ── Database writer ──────────────────────────────────────────────────────────
+# ── Database helpers ──────────────────────────────────────────────────────────
 DB_COLUMNS = [
     "email_subject", "recruiter", "client_recruiter", "email_from", "email_to",
     "delivery_type", "company_name", "general_skill", "date", "jr_no",
@@ -609,11 +618,43 @@ DB_COLUMNS = [
     "attachment", "remarks", "record_status",
 ]
 
+def _make_insert_sql():
+    return pgsql.SQL(
+        "INSERT INTO {table} ({fields}) VALUES ({placeholders})"
+    ).format(
+        table=pgsql.Identifier(DB_TABLE),
+        fields=pgsql.SQL(", ").join(map(pgsql.Identifier, DB_COLUMNS)),
+        placeholders=pgsql.SQL(", ").join(pgsql.Placeholder() * len(DB_COLUMNS)),
+    )
+
+def insert_records_incremental(conn, records: list[dict]) -> int:
+    """
+    Insert records using an already-open connection.
+    Commits after every successful row so partial progress is always saved.
+    The caller keeps the connection open across multiple calls.
+    """
+    insert_sql = _make_insert_sql()
+    inserted = 0
+    for rec in records:
+        row = tuple(rec.get(col) for col in DB_COLUMNS)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(insert_sql, row)
+            conn.commit()
+            inserted += 1
+        except Exception as exc:
+            log.error(
+                f"Row insert failed for candidate "
+                f"{rec.get('name_of_candidate', '?')!r}: {exc}"
+            )
+            conn.rollback()   # roll back only the failed row, keep going
+    return inserted
+
+
 def insert_records_to_db(records: list[dict]) -> int:
     """
-    Insert all records into the PostgreSQL table.
-    Returns the number of rows successfully inserted.
-    Uses a single transaction — rolls back all on failure.
+    Standalone bulk insert (kept for compatibility / one-off use).
+    Prefer insert_records_incremental inside the main loop.
     """
     if not records:
         log.warning("No records to insert into DB.")
@@ -623,32 +664,7 @@ def insert_records_to_db(records: list[dict]) -> int:
     try:
         conn = psycopg2.connect(DB_DSN)
         conn.autocommit = False
-        cur = conn.cursor()
-
-        insert_sql = pgsql.SQL(
-            "INSERT INTO {table} ({fields}) VALUES ({placeholders})"
-        ).format(
-            table=pgsql.Identifier(DB_TABLE),
-            fields=pgsql.SQL(", ").join(map(pgsql.Identifier, DB_COLUMNS)),
-            placeholders=pgsql.SQL(", ").join(pgsql.Placeholder() * len(DB_COLUMNS)),
-        )
-
-        for rec in records:
-            row = tuple(rec.get(col) for col in DB_COLUMNS)
-            try:
-                cur.execute(insert_sql, row)
-                inserted += 1
-            except Exception as exc:
-                log.error(
-                    f"Row insert failed for candidate "
-                    f"{rec.get('name_of_candidate', '?')!r}: {exc}"
-                )
-                conn.rollback()
-                # Re-open cursor so we can continue with remaining rows
-                cur = conn.cursor()
-
-        conn.commit()
-        cur.close()
+        inserted = insert_records_incremental(conn, records)
         conn.close()
         log.info(f"DB: inserted {inserted}/{len(records)} row(s) into '{DB_TABLE}'.")
     except Exception as exc:
@@ -733,32 +749,46 @@ def run() -> None:
     log.info(f"Pulling emails from: {SINCE_DATE} onwards")
     log.info(f"Folder: {INBOX_SUBFOLDER or '(root inbox)'}")
     log.info(f"DB table: {DB_TABLE}")
+    log.info(f"Skip uploads: {SKIP_UPLOADS}")
 
     mail_token = get_mail_token()
     od_token   = get_onedrive_token()
     log.info("Tokens obtained.")
 
     # Verify OneDrive access and ensure target folder exists
-    _drive_check = requests.get(
-        "https://graph.microsoft.com/v1.0/me/drive",
-        headers={"Authorization": f"Bearer {od_token}"},
-        timeout=30,
-    )
-    if _drive_check.status_code == 200:
-        log.info(f"OneDrive access confirmed for {ONEDRIVE_USER}.")
-        if ONEDRIVE_ARCHIVE_FOLDER:
-            _ensure_onedrive_folder(od_token, ONEDRIVE_ARCHIVE_FOLDER)
-    else:
-        log.warning(
-            f"OneDrive access check returned {_drive_check.status_code} — "
-            f"attachment uploads may fail. Response: {_drive_check.text[:200]}"
+    if not SKIP_UPLOADS:
+        _drive_check = requests.get(
+            "https://graph.microsoft.com/v1.0/me/drive",
+            headers={"Authorization": f"Bearer {od_token}"},
+            timeout=30,
         )
+        if _drive_check.status_code == 200:
+            log.info(f"OneDrive access confirmed for {ONEDRIVE_USER}.")
+            if ONEDRIVE_ARCHIVE_FOLDER:
+                _ensure_onedrive_folder(od_token, ONEDRIVE_ARCHIVE_FOLDER)
+        else:
+            log.warning(
+                f"OneDrive access check returned {_drive_check.status_code} — "
+                f"attachment uploads may fail. Response: {_drive_check.text[:200]}"
+            )
+    else:
+        log.info("Skipping OneDrive drive check (SKIP_UPLOADS=true).")
 
     folder_id = resolve_folder_id(mail_token, INBOX_SUBFOLDER) if INBOX_SUBFOLDER else None
     emails    = fetch_bs_emails(mail_token, folder_id)
 
+    # ── Open a single persistent DB connection for the entire run ─────────
+    try:
+        db_conn = psycopg2.connect(DB_DSN)
+        db_conn.autocommit = False
+        log.info("DB connection opened.")
+    except Exception as exc:
+        log.error(f"Cannot connect to DB: {exc} — records will NOT be inserted.")
+        db_conn = None
+
     records: list[dict] = []
-    skipped = 0
+    skipped  = 0
+    db_count = 0
 
     for msg in emails:
         subject = msg.get("subject", "").strip()
@@ -796,6 +826,8 @@ def run() -> None:
                 email_date = datetime.fromisoformat(raw_dt.replace("Z", "+00:00")).date()
             except ValueError:
                 pass
+
+        email_records: list[dict] = []
 
         for row in rows:
             row_date = _parse_date(row["date"]) if row.get("date") else None
@@ -843,18 +875,35 @@ def run() -> None:
                 }),
             }
             records.append(record)
+            email_records.append(record)
             log.info(f"  + {candidate_name or '(unknown)'} | {subject!r} | {row_date}")
 
+        # ── Insert this email's rows into DB immediately ───────────────────
+        # This means even if the job is cancelled mid-run, all rows
+        # processed so far are already safely committed to the database.
+        if email_records and db_conn is not None:
+            n = insert_records_incremental(db_conn, email_records)
+            db_count += n
+            log.info(
+                f"  DB committed {n}/{len(email_records)} row(s) for: {subject!r} "
+                f"(running total: {db_count})"
+            )
+
+    # ── Close DB connection ────────────────────────────────────────────────
+    if db_conn is not None:
+        try:
+            db_conn.close()
+            log.info("DB connection closed.")
+        except Exception:
+            pass
+
     log.info(f"Skipped {skipped} email(s) with no recognized company code.")
-    log.info(f"Total rows to write: {len(records)}")
+    log.info(f"Total rows collected : {len(records)}")
+    log.info(f"Total DB rows inserted: {db_count}")
 
     if not records:
         log.warning("No matching records found. Nothing to write.")
         return
-
-    # ── Write to DB ────────────────────────────────────────────────────────
-    db_count = insert_records_to_db(records)
-    log.info(f"DB insert complete: {db_count} row(s) inserted into '{DB_TABLE}'.")
 
     # ── Write Excel ────────────────────────────────────────────────────────
     ts          = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -7,7 +7,7 @@ jobs:
   extract-emails:
     name: Extract & Insert Recruitment Emails
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 60
     env:
       AZURE_TENANT_ID:      ${{ secrets.AZURE_TENANT_ID }}
       AZURE_CLIENT_ID:      ${{ secrets.AZURE_CLIENT_ID }}
