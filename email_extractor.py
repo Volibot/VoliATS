@@ -481,7 +481,7 @@ def parse_html_table(html: str) -> list[dict]:
     which breaks regex-based <tr>...</tr> matching.
     """
     rows: list[dict] = []
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
 
     for table in soup.find_all("table"):
         # Get only DIRECT child rows (not rows from nested inner tables)
