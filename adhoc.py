@@ -1,7 +1,7 @@
 """
 Ad-hoc extractor: pulls candidate emails from "Company Profiles" subfolder
-received on or after 2026-01-01 and writes parsed fields to the
-`temp_hrvolibit_archive` PostgreSQL table.
+received on or after 2026-01-01, writes parsed fields to the
+`temp_hrvolibit_archive` PostgreSQL table, and saves an Excel report.
 
 Subject filters accepted:
   - CODE: ...
@@ -14,13 +14,20 @@ Output: adhoc_candidates_<timestamp>.xlsx in the current working directory.
 Required env vars:
   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
   TARGET_MAILBOX
+  OD_TENANT_ID, OD_CLIENT_ID, OD_REFRESH_TOKEN, ONEDRIVE_USER
+  DB_DSN
 
 Optional:
-  INBOX_SUBFOLDER   (default: "Company Profiles")
+  AZURE_CLIENT_SECRET   (app secret)
+  OD_CLIENT_SECRET      (OneDrive secret — can be empty for public apps)
+  INBOX_SUBFOLDER       (default: "Company Profiles")
+  DB_TABLE_NAME         (default: "temp_hrvolibit_archive")
+  ONEDRIVE_ARCHIVE_FOLDER (default: "archive")
+  LIMIT                 (default: 100)
 
 ── Local run ────────────────────────────────────────────────────────────────────
 1. Install dependencies:
-       pip install msal openpyxl requests python-dotenv
+       pip install msal openpyxl requests python-dotenv psycopg2-binary
 
 2. Create a .env file next to this script (⚠️ never commit it to git):
 
@@ -28,14 +35,14 @@ Optional:
        AZURE_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
        AZURE_CLIENT_SECRET=your-secret-here
        TARGET_MAILBOX=mailbox@yourdomain.com
+       OD_TENANT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+       OD_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+       OD_REFRESH_TOKEN=your-refresh-token
+       ONEDRIVE_USER=user@yourdomain.com
+       DB_DSN=postgresql://user:password@host:5432/dbname
 
 3. Run:
-       python -m dotenv run -- python bs_extractor.py
-
-   Or export vars manually:
-       export $(cat .env | xargs) && python bs_extractor.py
-
-   Output Excel is written to the current directory as bs_candidates_<timestamp>.xlsx
+       python bs_extractor.py
 ────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -52,7 +59,9 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from msal import ConfidentialClientApplication, PublicClientApplication
 from dotenv import load_dotenv
+
 load_dotenv()
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -71,15 +80,15 @@ INBOX_SUBFOLDER = os.environ.get("INBOX_SUBFOLDER", "Company Profiles")
 VOLIBITS_DOMAIN = "volibits.com"
 RESUME_EXTENSIONS = {".pdf", ".doc", ".docx"}
 
-OD_TENANT_ID        = os.environ["OD_TENANT_ID"]
-OD_CLIENT_ID        = os.environ["OD_CLIENT_ID"]
-OD_CLIENT_SECRET    = os.environ.get("OD_CLIENT_SECRET", "")
-OD_REFRESH_TOKEN    = os.environ["OD_REFRESH_TOKEN"]
-ONEDRIVE_USER       = os.environ["ONEDRIVE_USER"]
-DB_DSN              = os.environ["DB_DSN"]
-DB_TABLE            = os.environ.get("DB_TABLE_NAME", "temp_hrvolibit_archive")
+OD_TENANT_ID            = os.environ["OD_TENANT_ID"]
+OD_CLIENT_ID            = os.environ["OD_CLIENT_ID"]
+OD_CLIENT_SECRET        = os.environ.get("OD_CLIENT_SECRET", "")
+OD_REFRESH_TOKEN        = os.environ["OD_REFRESH_TOKEN"]
+ONEDRIVE_USER           = os.environ["ONEDRIVE_USER"]
+DB_DSN                  = os.environ["DB_DSN"]
+DB_TABLE                = "temp_hrvolibit_archive"
 ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "archive")
-Limit               = int(os.environ.get("LIMIT", "100"))
+LIMIT                   = int(os.environ.get("LIMIT", "100"))
 
 COMPANY_CODES: dict[str, str] = {
     "BS":  "Birlasoft",
@@ -98,10 +107,8 @@ COMPANY_CODES: dict[str, str] = {
     "RS":  "RS Software",
 }
 
-# Only pull emails from this date onwards
 SINCE_DATE = date(2026, 1, 1)
 
-# Excel columns — exactly matching the DB fields
 EXCEL_COLUMNS = [
     "email_subject",
     "recruiter", "client_recruiter", "email_from", "email_to",
@@ -220,7 +227,6 @@ def _resolve_header(raw: str) -> Optional[str]:
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 def _get_app_token(tenant_id: str, client_id: str, client_secret: str) -> str:
-    """Client-credentials (app-only) token — used for mail reading."""
     result = ConfidentialClientApplication(
         client_id,
         authority=f"https://login.microsoftonline.com/{tenant_id}",
@@ -234,20 +240,13 @@ def _get_app_token(tenant_id: str, client_id: str, client_secret: str) -> str:
 
 
 def get_mail_token() -> str:
-    """App-only token for reading TARGET_MAILBOX via Mail.Read application permission."""
     return _get_app_token(AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET)
 
 
 def get_onedrive_token() -> str:
     """
-    Delegated token for ONEDRIVE_USER's personal OneDrive.
-
-    Uses a stored refresh token (OD_REFRESH_TOKEN) so no interactive login
-    is needed at runtime. The PublicClientApplication.acquire_token_by_refresh_token
-    call exchanges the refresh token for a fresh access token each run.
-
-    Refresh tokens last ~90 days. Re-run generate_refresh_token.py before
-    expiry and update the OD_REFRESH_TOKEN GitHub Secret.
+    Delegated token via stored refresh token.
+    Refresh tokens last ~90 days — re-run generate_refresh_token.py before expiry.
     """
     app = PublicClientApplication(
         OD_CLIENT_ID,
@@ -258,14 +257,13 @@ def get_onedrive_token() -> str:
         scopes=["https://graph.microsoft.com/.default"],
     )
     if "access_token" not in result:
-        error_desc = result.get("error_description", str(result))
         raise RuntimeError(
-            f"OneDrive token refresh failed: {error_desc}\n"
-            "If the refresh token has expired, re-run generate_refresh_token.py "
-            "and update the OD_REFRESH_TOKEN GitHub Secret."
+            f"OneDrive token refresh failed: {result.get('error_description', str(result))}\n"
+            "Re-run generate_refresh_token.py and update OD_REFRESH_TOKEN."
         )
     log.info("OneDrive delegated token obtained successfully.")
     return result["access_token"]
+
 
 # ── Folder resolution ─────────────────────────────────────────────────────────
 def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
@@ -295,6 +293,7 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
     log.warning(f"Folder {folder_name!r} not found — will use root inbox")
     return None
 
+
 # ── Fetch emails (paginated, filtered by date) ────────────────────────────────
 def fetch_bs_emails(token: str, folder_id: Optional[str]) -> list[dict]:
     headers = {"Authorization": f"Bearer {token}"}
@@ -310,19 +309,31 @@ def fetch_bs_emails(token: str, folder_id: Optional[str]) -> list[dict]:
 
     url = (
         f"{base}"
-        f"?$top=100"
+        f"?$top=50"  # reduced page size to avoid gateway timeouts
         f"&$select=id,subject,from,toRecipients,body,receivedDateTime,hasAttachments"
-        # ← removed $expand=attachments here
         f"&$filter=receivedDateTime ge {since_iso}"
         f"&$orderby=receivedDateTime asc"
     )
 
     all_emails: list[dict] = []
+    page = 0
     while url:
-        resp = requests.get(url, headers=headers, timeout=60)  # increased timeout
-        resp.raise_for_status()
+        page += 1
+        log.info(f"Fetching email page {page}…")
+        try:
+            resp = requests.get(url, headers=headers, timeout=90)
+            resp.raise_for_status()
+        except requests.exceptions.Timeout:
+            log.error(f"Timeout on page {page} — stopping pagination. Got {len(all_emails)} emails so far.")
+            break
+        except requests.exceptions.RequestException as exc:
+            log.error(f"Request error on page {page}: {exc} — stopping pagination.")
+            break
+
         data = resp.json()
-        all_emails.extend(data.get("value", []))
+        batch = data.get("value", [])
+        all_emails.extend(batch)
+        log.info(f"  Page {page}: {len(batch)} email(s) (total so far: {len(all_emails)})")
         url = data.get("@odata.nextLink")
 
     log.info(f"Fetched {len(all_emails)} email(s) since {SINCE_DATE}.")
@@ -333,12 +344,17 @@ def fetch_bs_emails(token: str, folder_id: Optional[str]) -> list[dict]:
 def _is_resume(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in RESUME_EXTENSIONS
 
+
 def _fetch_attachment_content(mail_token: str, message_id: str, attachment_id: str) -> bytes:
     url = (
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
         f"/messages/{message_id}/attachments/{attachment_id}/$value"
     )
-    resp = requests.get(url, headers={"Authorization": f"Bearer {mail_token}"}, timeout=60)
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {mail_token}"},
+        timeout=120,  # large attachments can be slow
+    )
     resp.raise_for_status()
     return resp.content
 
@@ -379,15 +395,20 @@ def _ensure_onedrive_folder(od_token: str, folder_name: str) -> None:
 def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optional[str]:
     remote_path = f"{ONEDRIVE_ARCHIVE_FOLDER}/{filename}" if ONEDRIVE_ARCHIVE_FOLDER else filename
     upload_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/content"
-    resp = requests.put(
-        upload_url,
-        headers={
-            "Authorization": f"Bearer {od_token}",
-            "Content-Type": "application/octet-stream",
-        },
-        data=content,
-        timeout=120,
-    )
+    try:
+        resp = requests.put(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {od_token}",
+                "Content-Type": "application/octet-stream",
+            },
+            data=content,
+            timeout=120,
+        )
+    except requests.exceptions.Timeout:
+        log.error(f"Upload timed out for {filename!r}")
+        return None
+
     if resp.status_code not in (200, 201):
         log.error(
             f"OneDrive upload failed for {filename!r}: "
@@ -397,30 +418,38 @@ def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optiona
 
     item = resp.json()
     item_id = item.get("id")
-    link_resp = requests.post(
-        f"https://graph.microsoft.com/v1.0/me/drive/items/{item_id}/createLink",
-        headers={
-            "Authorization": f"Bearer {od_token}",
-            "Content-Type": "application/json",
-        },
-        json={"type": "view", "scope": "organization"},
-        timeout=30,
-    )
-    if link_resp.status_code in (200, 201):
-        web_url = link_resp.json().get("link", {}).get("webUrl", "")
-        if web_url:
-            log.info(f"  ↑ Uploaded {filename!r} → {web_url}")
-            return web_url
+    try:
+        link_resp = requests.post(
+            f"https://graph.microsoft.com/v1.0/me/drive/items/{item_id}/createLink",
+            headers={
+                "Authorization": f"Bearer {od_token}",
+                "Content-Type": "application/json",
+            },
+            json={"type": "view", "scope": "organization"},
+            timeout=30,
+        )
+        if link_resp.status_code in (200, 201):
+            web_url = link_resp.json().get("link", {}).get("webUrl", "")
+            if web_url:
+                log.info(f"  ↑ Uploaded {filename!r} → {web_url}")
+                return web_url
+    except Exception as exc:
+        log.warning(f"createLink failed for {filename!r}: {exc}")
 
     fallback = item.get("webUrl", "")
     if fallback:
-        log.warning(f"createLink failed for {filename!r}; using webUrl: {fallback}")
+        log.warning(f"Using item webUrl for {filename!r}: {fallback}")
         return fallback
 
     return None
 
 
 def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
+    """
+    Fetch resume attachments from the email, upload to OneDrive, return
+    a comma-separated string of share links (or filenames on failure).
+    Returns "" if the email has no attachments.
+    """
     if not msg.get("hasAttachments"):
         return ""
 
@@ -429,7 +458,11 @@ def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
         f"/messages/{msg['id']}/attachments?$select=id,name,contentType"
     )
     try:
-        resp = requests.get(url, headers={"Authorization": f"Bearer {mail_token}"}, timeout=60)
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {mail_token}"},
+            timeout=60,
+        )
         resp.raise_for_status()
         attachments = resp.json().get("value", [])
     except Exception as exc:
@@ -456,22 +489,7 @@ def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
 
     return ", ".join(links)
 
-# ── Subject filter ────────────────────────────────────────────────────────────
-    if not msg.get("hasAttachments"):
-        return ""
-    url = (
-        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
-        f"/messages/{msg['id']}/attachments?$select=name,contentType"
-    )
-    try:
-        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-        resp.raise_for_status()
-        attachments = resp.json().get("value", [])
-        names = [a.get("name", "") for a in attachments if _is_resume(a.get("name", ""))]
-        return ", ".join(names)
-    except Exception as exc:
-        log.warning(f"Could not fetch attachments for {msg['id']}: {exc}")
-        return ""
+
 # ── Subject filter ────────────────────────────────────────────────────────────
 SUBJECT_RE = re.compile(
     r"(?<!\S)(?:\[External\]\s*:\s*)?(?P<code>[A-Za-z]{2,4})\s*:",
@@ -510,6 +528,7 @@ def parse_subject(subject: str) -> Optional[tuple[str, str, str, Optional[str]]]
     jr_no, skill = _extract_jr_and_skill(rest)
     return code, company_name, skill, jr_no
 
+
 # ── HTML table parser ─────────────────────────────────────────────────────────
 def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
@@ -537,6 +556,7 @@ def parse_html_table(html: str) -> list[dict]:
             if record:
                 rows.append(record)
     return rows
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _extract_address(addr_obj: dict) -> str:
@@ -577,6 +597,66 @@ def _t(val) -> Optional[str]:
     v = str(val).strip()
     return v or None
 
+
+# ── Database writer ──────────────────────────────────────────────────────────
+DB_COLUMNS = [
+    "email_subject", "recruiter", "client_recruiter", "email_from", "email_to",
+    "delivery_type", "company_name", "general_skill", "date", "jr_no",
+    "name_of_candidate", "contact_number", "email_id",
+    "total_experience", "relevant_experience",
+    "current_ctc", "expected_ctc", "notice_period",
+    "current_org", "current_location", "preferred_location",
+    "attachment", "remarks", "record_status",
+]
+
+def insert_records_to_db(records: list[dict]) -> int:
+    """
+    Insert all records into the PostgreSQL table.
+    Returns the number of rows successfully inserted.
+    Uses a single transaction — rolls back all on failure.
+    """
+    if not records:
+        log.warning("No records to insert into DB.")
+        return 0
+
+    inserted = 0
+    try:
+        conn = psycopg2.connect(DB_DSN)
+        conn.autocommit = False
+        cur = conn.cursor()
+
+        insert_sql = pgsql.SQL(
+            "INSERT INTO {table} ({fields}) VALUES ({placeholders})"
+        ).format(
+            table=pgsql.Identifier(DB_TABLE),
+            fields=pgsql.SQL(", ").join(map(pgsql.Identifier, DB_COLUMNS)),
+            placeholders=pgsql.SQL(", ").join(pgsql.Placeholder() * len(DB_COLUMNS)),
+        )
+
+        for rec in records:
+            row = tuple(rec.get(col) for col in DB_COLUMNS)
+            try:
+                cur.execute(insert_sql, row)
+                inserted += 1
+            except Exception as exc:
+                log.error(
+                    f"Row insert failed for candidate "
+                    f"{rec.get('name_of_candidate', '?')!r}: {exc}"
+                )
+                conn.rollback()
+                # Re-open cursor so we can continue with remaining rows
+                cur = conn.cursor()
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        log.info(f"DB: inserted {inserted}/{len(records)} row(s) into '{DB_TABLE}'.")
+    except Exception as exc:
+        log.error(f"DB connection/transaction failed: {exc}")
+
+    return inserted
+
+
 # ── Excel writer ──────────────────────────────────────────────────────────────
 HEADER_FILL  = PatternFill("solid", start_color="1F4E79")
 HEADER_FONT  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
@@ -613,7 +693,7 @@ PRETTY_HEADERS = {
 def write_excel(records: list[dict], output_path: str) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "BS Candidates"
+    ws.title = "Candidates"
     ws.freeze_panes = "A2"
 
     for col_idx, col in enumerate(EXCEL_COLUMNS, 1):
@@ -637,13 +717,12 @@ def write_excel(records: list[dict], output_path: str) -> None:
             cell.alignment = LEFT
             if col == "record_status" and val in STATUS_COLORS:
                 cell.fill = PatternFill("solid", start_color=STATUS_COLORS[val])
-
         ws.row_dimensions[row_idx].height = 16
 
     ws.auto_filter.ref = ws.dimensions
-
     wb.save(output_path)
     log.info(f"Saved {len(records)} row(s) → {output_path}")
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def run() -> None:
@@ -653,6 +732,7 @@ def run() -> None:
     log.info(f"OneDrive folder: {ONEDRIVE_ARCHIVE_FOLDER}")
     log.info(f"Pulling emails from: {SINCE_DATE} onwards")
     log.info(f"Folder: {INBOX_SUBFOLDER or '(root inbox)'}")
+    log.info(f"DB table: {DB_TABLE}")
 
     mail_token = get_mail_token()
     od_token   = get_onedrive_token()
@@ -670,9 +750,8 @@ def run() -> None:
             _ensure_onedrive_folder(od_token, ONEDRIVE_ARCHIVE_FOLDER)
     else:
         log.warning(
-            f"OneDrive access check returned {_drive_check.status_code} for "
-            f"{ONEDRIVE_USER} — attachment uploads may fail. "
-            f"Response: {_drive_check.text[:200]}"
+            f"OneDrive access check returned {_drive_check.status_code} — "
+            f"attachment uploads may fail. Response: {_drive_check.text[:200]}"
         )
 
     folder_id = resolve_folder_id(mail_token, INBOX_SUBFOLDER) if INBOX_SUBFOLDER else None
@@ -770,13 +849,23 @@ def run() -> None:
     log.info(f"Total rows to write: {len(records)}")
 
     if not records:
-        log.warning("No matching records found. No Excel file written.")
+        log.warning("No matching records found. Nothing to write.")
         return
 
+    # ── Write to DB ────────────────────────────────────────────────────────
+    db_count = insert_records_to_db(records)
+    log.info(f"DB insert complete: {db_count} row(s) inserted into '{DB_TABLE}'.")
+
+    # ── Write Excel ────────────────────────────────────────────────────────
     ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = f"adhoc_candidates_{ts}.xlsx"
     write_excel(records, output_path)
-    print(f"\n✅  Done — {len(records)} row(s) written to: {output_path}\n")
+
+    print(
+        f"\n✅  Done — {len(records)} row(s) processed.\n"
+        f"    DB rows inserted : {db_count}\n"
+        f"    Excel output     : {output_path}\n"
+    )
 
 
 if __name__ == "__main__":
