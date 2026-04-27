@@ -23,7 +23,7 @@ jobs:
       ONEDRIVE_FOLDER:      ${{ secrets.ONEDRIVE_FOLDER }}
       NOTIFY_CC_EMAILS:     ${{ secrets.NOTIFY_CC_EMAILS }}
       Limit:                ${{ secrets.Limit }}
-      ENABLE_NOTIFICATIONS: "false"
+      ENABLE_NOTIFICATIONS: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
