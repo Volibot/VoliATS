@@ -487,16 +487,40 @@ _JR_PATTERNS = [
     re.compile(r"\b(?P<jr>\d{4,})\b",                     re.IGNORECASE),
 ]
 
+# Filler phrases: "Profile(s) for [the]", "Profiles of [the]",
+#                 "Sharing profile", "CV for [the]", "Resume for [the]", etc.
+_SKILL_FILLER_RE = re.compile(
+    r"\b(?:profiles?\s+for\s+(?:the\s+)?"
+    r"|profiles?\s+of\s+(?:the\s+)?"
+    r"|sharing\s+profiles?\s+for\s+(?:the\s+)?"
+    r"|sharing\s+profiles?\s*"
+    r"|cv\s+for\s+(?:the\s+)?"
+    r"|resume\s+for\s+(?:the\s+)?"
+    r"|candidate\s+for\s+(?:the\s+)?)",
+    re.IGNORECASE,
+)
+
+_JR_STUB_RE = re.compile(r"\bjr\.?\s*(?:no\.?)?\s*$", re.IGNORECASE)
+
 def _extract_jr_and_skill(rest: str) -> tuple[Optional[str], str]:
-    rest = re.sub(r"^[-|%\s]+|[-|%\s]+$", "", rest.strip()).strip()
-    jr_no = None
-    for pat in _JR_PATTERNS:
-        m = pat.search(rest)
+    rest = rest.strip()
+    jr_no: Optional[str] = None
+
+    for pattern in _JR_PATTERNS:
+        m = pattern.search(rest)
         if m:
             jr_no = m.group("jr")
-            s, e = m.span()
-            rest = re.sub(r"^[-|%\s]+|[-|%\s]+$", "", (rest[:s] + " " + rest[e:]).strip()).strip()
+            start, end = m.span()
+            rest = (rest[:start] + " " + rest[end:]).strip()
+            # Remove separators and bare "Jr."/"Jr. No." stubs left behind
+            rest = re.sub(r"^[-|.\s]+|[-|.\s]+$", "", rest).strip()
+            rest = _JR_STUB_RE.sub("", rest).strip()
+            rest = re.sub(r"[-|.\s]+$", "", rest).strip()
             break
+
+    # Strip filler phrases, then clean up remaining separators
+    rest = _SKILL_FILLER_RE.sub("", rest).strip()
+    rest = re.sub(r"^[-|.\s]+|[-|.\s]+$", "", rest).strip()
     return jr_no, re.sub(r"\s{2,}", " ", rest).strip()
 
 def parse_subject(subject: str) -> Optional[tuple[str, str, str, Optional[str]]]:
