@@ -95,7 +95,7 @@ DB_TABLE  = "temp_hrvolibit_archive"
 ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "archive")
 LIMIT                   = int(os.environ.get("LIMIT", "100"))
 
-SKIP_UPLOADS = os.environ.get("SKIP_UPLOADS", "false")
+SKIP_UPLOADS = os.environ.get("SKIP_UPLOADS", "false").strip().lower() in ("1", "true", "yes")
 
 COMPANY_CODES: dict[str, str] = {
     "BS":  "Birlasoft",
