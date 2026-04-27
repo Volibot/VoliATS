@@ -540,11 +540,11 @@ def send_diff_recruiter_notification_email(
     if not ENABLE_NOTIFICATIONS:
         log.info("Notifications disabled (ENABLE_NOTIFICATIONS=false) — skipping.")
         return
-        candidate_name = (
-        _val(new_record_data.get("name_of_candidate"))
-        or _val(existing_row.get("name_of_candidate"))
-        or "Unknown Candidate"
-    )
+    candidate_name = (
+    _val(new_record_data.get("name_of_candidate"))
+    or _val(existing_row.get("name_of_candidate"))
+    or "Unknown Candidate"
+)
     existing_recruiter = existing_row.get("recruiter", "—")
     new_recruiter      = new_record_data.get("recruiter", "—")
     insert_date        = _val(new_record_data.get("date")) or datetime.now().strftime("%d %b %Y")

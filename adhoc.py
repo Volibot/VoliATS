@@ -1,7 +1,7 @@
 """
 Ad-hoc extractor: pulls candidate emails from "Company Profiles" subfolder
-received on or after 2026-01-01 and writes parsed fields to the
-`temp_hrvolibit_archive` PostgreSQL table.
+received on or after 2026-01-01, writes parsed fields to the
+`public.temp_hrvolibit_archive` PostgreSQL table, and saves an Excel report.
 
 Subject filters accepted:
   - CODE: ...
@@ -14,13 +14,21 @@ Output: adhoc_candidates_<timestamp>.xlsx in the current working directory.
 Required env vars:
   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
   TARGET_MAILBOX
+  OD_TENANT_ID, OD_CLIENT_ID, OD_REFRESH_TOKEN, ONEDRIVE_USER
+  DB_DSN
 
 Optional:
-  INBOX_SUBFOLDER   (default: "Company Profiles")
+  OD_CLIENT_SECRET        (OneDrive secret — can be empty for public apps)
+  INBOX_SUBFOLDER         (default: "Company Profiles")
+  DB_SCHEMA               (default: "public")
+  DB_TABLE_NAME           (default: "temp_hrvolibit_archive")
+  ONEDRIVE_ARCHIVE_FOLDER (default: "archive")
+  LIMIT                   (default: 100)
+  SKIP_UPLOADS            (default: false — set "true" to skip OneDrive uploads)
 
 ── Local run ────────────────────────────────────────────────────────────────────
 1. Install dependencies:
-       pip install msal openpyxl requests python-dotenv
+       pip install msal openpyxl requests python-dotenv psycopg2-binary
 
 2. Create a .env file next to this script (⚠️ never commit it to git):
 
@@ -28,32 +36,35 @@ Optional:
        AZURE_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
        AZURE_CLIENT_SECRET=your-secret-here
        TARGET_MAILBOX=mailbox@yourdomain.com
+       OD_TENANT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+       OD_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+       OD_REFRESH_TOKEN=your-refresh-token
+       ONEDRIVE_USER=user@yourdomain.com
+       DB_DSN=postgresql://user:password@host:5432/dbname
 
 3. Run:
-       python -m dotenv run -- python bs_extractor.py
-
-   Or export vars manually:
-       export $(cat .env | xargs) && python bs_extractor.py
-
-   Output Excel is written to the current directory as bs_candidates_<timestamp>.xlsx
+       python bs_extractor.py
 ────────────────────────────────────────────────────────────────────────────────
 """
 
 import os
 import re
+import html as html_lib
 import logging
 import requests
 import psycopg2
 from psycopg2 import sql as pgsql
-from datetime import datetime, date, timezone
+from datetime import datetime, date
 from typing import Optional
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from msal import ConfidentialClientApplication, PublicClientApplication
 from dotenv import load_dotenv
+
 load_dotenv()
-# ── Logging ──────────────────────────────────────────────────────────────────
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -71,15 +82,20 @@ INBOX_SUBFOLDER = os.environ.get("INBOX_SUBFOLDER", "Company Profiles")
 VOLIBITS_DOMAIN = "volibits.com"
 RESUME_EXTENSIONS = {".pdf", ".doc", ".docx"}
 
-OD_TENANT_ID        = os.environ["OD_TENANT_ID"]
-OD_CLIENT_ID        = os.environ["OD_CLIENT_ID"]
-OD_CLIENT_SECRET    = os.environ.get("OD_CLIENT_SECRET", "")
-OD_REFRESH_TOKEN    = os.environ["OD_REFRESH_TOKEN"]
-ONEDRIVE_USER       = os.environ["ONEDRIVE_USER"]
-DB_DSN              = os.environ["DB_DSN"]
-DB_TABLE            = os.environ.get("DB_TABLE_NAME", "temp_hrvolibit_archive")
+OD_TENANT_ID            = os.environ["OD_TENANT_ID"]
+OD_CLIENT_ID            = os.environ["OD_CLIENT_ID"]
+OD_CLIENT_SECRET        = os.environ.get("OD_CLIENT_SECRET", "")
+OD_REFRESH_TOKEN        = os.environ["OD_REFRESH_TOKEN"]
+ONEDRIVE_USER           = os.environ["ONEDRIVE_USER"]
+DB_DSN                  = os.environ["DB_DSN"]
+
+DB_SCHEMA = os.environ.get("DB_SCHEMA", "public")
+DB_TABLE  = "temp_hrvolibit_archive"
+
 ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "archive")
-Limit               = int(os.environ.get("LIMIT", "100"))
+LIMIT                   = int(os.environ.get("LIMIT", "100"))
+
+SKIP_UPLOADS = os.environ.get("SKIP_UPLOADS", "false").strip().lower() in ("1", "true", "yes")
 
 COMPANY_CODES: dict[str, str] = {
     "BS":  "Birlasoft",
@@ -98,10 +114,8 @@ COMPANY_CODES: dict[str, str] = {
     "RS":  "RS Software",
 }
 
-# Only pull emails from this date onwards
 SINCE_DATE = date(2026, 1, 1)
 
-# Excel columns — exactly matching the DB fields
 EXCEL_COLUMNS = [
     "email_subject",
     "recruiter", "client_recruiter", "email_from", "email_to",
@@ -112,6 +126,33 @@ EXCEL_COLUMNS = [
     "current_ctc", "expected_ctc", "notice_period",
     "current_org", "current_location", "preferred_location",
     "attachment", "remarks", "record_status",
+]
+
+DB_COLUMNS = [
+    "email_subject",
+    "recruiter",
+    "client_recruiter",
+    "email_from",
+    "email_to",
+    "delivery_type",
+    "company_name",
+    "general_skill",
+    "date",
+    "jr_no",
+    "name_of_candidate",
+    "contact_number",
+    "email_id",
+    "total_experience",
+    "relevant_experience",
+    "current_ctc",
+    "expected_ctc",
+    "notice_period",
+    "current_org",
+    "current_location",
+    "preferred_location",
+    "attachment",
+    "remarks",
+    "record_status",
 ]
 
 # ── Column aliases ─────────────────────────────────────────────────────────────
@@ -218,9 +259,9 @@ ALIAS_MAP: dict[str, str] = {
 def _resolve_header(raw: str) -> Optional[str]:
     return ALIAS_MAP.get(_normalize(raw))
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+
+# ── Auth ───────────────────────────────────────────────────────────────────────
 def _get_app_token(tenant_id: str, client_id: str, client_secret: str) -> str:
-    """Client-credentials (app-only) token — used for mail reading."""
     result = ConfidentialClientApplication(
         client_id,
         authority=f"https://login.microsoftonline.com/{tenant_id}",
@@ -234,21 +275,10 @@ def _get_app_token(tenant_id: str, client_id: str, client_secret: str) -> str:
 
 
 def get_mail_token() -> str:
-    """App-only token for reading TARGET_MAILBOX via Mail.Read application permission."""
     return _get_app_token(AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET)
 
 
 def get_onedrive_token() -> str:
-    """
-    Delegated token for ONEDRIVE_USER's personal OneDrive.
-
-    Uses a stored refresh token (OD_REFRESH_TOKEN) so no interactive login
-    is needed at runtime. The PublicClientApplication.acquire_token_by_refresh_token
-    call exchanges the refresh token for a fresh access token each run.
-
-    Refresh tokens last ~90 days. Re-run generate_refresh_token.py before
-    expiry and update the OD_REFRESH_TOKEN GitHub Secret.
-    """
     app = PublicClientApplication(
         OD_CLIENT_ID,
         authority=f"https://login.microsoftonline.com/{OD_TENANT_ID}",
@@ -258,16 +288,15 @@ def get_onedrive_token() -> str:
         scopes=["https://graph.microsoft.com/.default"],
     )
     if "access_token" not in result:
-        error_desc = result.get("error_description", str(result))
         raise RuntimeError(
-            f"OneDrive token refresh failed: {error_desc}\n"
-            "If the refresh token has expired, re-run generate_refresh_token.py "
-            "and update the OD_REFRESH_TOKEN GitHub Secret."
+            f"OneDrive token refresh failed: {result.get('error_description', str(result))}\n"
+            "Re-run generate_refresh_token.py and update OD_REFRESH_TOKEN."
         )
     log.info("OneDrive delegated token obtained successfully.")
     return result["access_token"]
 
-# ── Folder resolution ─────────────────────────────────────────────────────────
+
+# ── Folder resolution ──────────────────────────────────────────────────────────
 def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
     if not folder_name:
         return None
@@ -295,7 +324,8 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
     log.warning(f"Folder {folder_name!r} not found — will use root inbox")
     return None
 
-# ── Fetch emails (paginated, filtered by date) ────────────────────────────────
+
+# ── Fetch emails ───────────────────────────────────────────────────────────────
 def fetch_bs_emails(token: str, folder_id: Optional[str]) -> list[dict]:
     headers = {"Authorization": f"Bearer {token}"}
     since_iso = f"{SINCE_DATE.isoformat()}T00:00:00Z"
@@ -310,35 +340,52 @@ def fetch_bs_emails(token: str, folder_id: Optional[str]) -> list[dict]:
 
     url = (
         f"{base}"
-        f"?$top=100"
+        f"?$top=50"
         f"&$select=id,subject,from,toRecipients,body,receivedDateTime,hasAttachments"
-        # ← removed $expand=attachments here
         f"&$filter=receivedDateTime ge {since_iso}"
         f"&$orderby=receivedDateTime asc"
     )
 
     all_emails: list[dict] = []
+    page = 0
     while url:
-        resp = requests.get(url, headers=headers, timeout=60)  # increased timeout
-        resp.raise_for_status()
+        page += 1
+        log.info(f"Fetching email page {page}…")
+        try:
+            resp = requests.get(url, headers=headers, timeout=90)
+            resp.raise_for_status()
+        except requests.exceptions.Timeout:
+            log.error(f"Timeout on page {page} — stopping. Got {len(all_emails)} emails so far.")
+            break
+        except requests.exceptions.RequestException as exc:
+            log.error(f"Request error on page {page}: {exc} — stopping.")
+            break
+
         data = resp.json()
-        all_emails.extend(data.get("value", []))
+        batch = data.get("value", [])
+        all_emails.extend(batch)
+        log.info(f"  Page {page}: {len(batch)} email(s) (total so far: {len(all_emails)})")
         url = data.get("@odata.nextLink")
 
     log.info(f"Fetched {len(all_emails)} email(s) since {SINCE_DATE}.")
     return all_emails
 
 
-# ── OneDrive attachment helpers ──────────────────────────────────────────────
+# ── OneDrive attachment helpers ────────────────────────────────────────────────
 def _is_resume(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in RESUME_EXTENSIONS
+
 
 def _fetch_attachment_content(mail_token: str, message_id: str, attachment_id: str) -> bytes:
     url = (
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
         f"/messages/{message_id}/attachments/{attachment_id}/$value"
     )
-    resp = requests.get(url, headers={"Authorization": f"Bearer {mail_token}"}, timeout=60)
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {mail_token}"},
+        timeout=120,
+    )
     resp.raise_for_status()
     return resp.content
 
@@ -356,7 +403,6 @@ def _ensure_onedrive_folder(od_token: str, folder_name: str) -> None:
     if check.status_code == 200:
         log.info(f"OneDrive folder '{folder_name}' already exists.")
         return
-
     resp = requests.post(
         "https://graph.microsoft.com/v1.0/me/drive/root/children",
         headers=headers,
@@ -379,15 +425,20 @@ def _ensure_onedrive_folder(od_token: str, folder_name: str) -> None:
 def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optional[str]:
     remote_path = f"{ONEDRIVE_ARCHIVE_FOLDER}/{filename}" if ONEDRIVE_ARCHIVE_FOLDER else filename
     upload_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/content"
-    resp = requests.put(
-        upload_url,
-        headers={
-            "Authorization": f"Bearer {od_token}",
-            "Content-Type": "application/octet-stream",
-        },
-        data=content,
-        timeout=120,
-    )
+    try:
+        resp = requests.put(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {od_token}",
+                "Content-Type": "application/octet-stream",
+            },
+            data=content,
+            timeout=120,
+        )
+    except requests.exceptions.Timeout:
+        log.error(f"Upload timed out for {filename!r}")
+        return None
+
     if resp.status_code not in (200, 201):
         log.error(
             f"OneDrive upload failed for {filename!r}: "
@@ -397,30 +448,37 @@ def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optiona
 
     item = resp.json()
     item_id = item.get("id")
-    link_resp = requests.post(
-        f"https://graph.microsoft.com/v1.0/me/drive/items/{item_id}/createLink",
-        headers={
-            "Authorization": f"Bearer {od_token}",
-            "Content-Type": "application/json",
-        },
-        json={"type": "view", "scope": "organization"},
-        timeout=30,
-    )
-    if link_resp.status_code in (200, 201):
-        web_url = link_resp.json().get("link", {}).get("webUrl", "")
-        if web_url:
-            log.info(f"  ↑ Uploaded {filename!r} → {web_url}")
-            return web_url
+    try:
+        link_resp = requests.post(
+            f"https://graph.microsoft.com/v1.0/me/drive/items/{item_id}/createLink",
+            headers={
+                "Authorization": f"Bearer {od_token}",
+                "Content-Type": "application/json",
+            },
+            json={"type": "view", "scope": "organization"},
+            timeout=30,
+        )
+        if link_resp.status_code in (200, 201):
+            web_url = link_resp.json().get("link", {}).get("webUrl", "")
+            if web_url:
+                log.info(f"  ↑ Uploaded {filename!r} → {web_url}")
+                return web_url
+    except Exception as exc:
+        log.warning(f"createLink failed for {filename!r}: {exc}")
 
     fallback = item.get("webUrl", "")
     if fallback:
-        log.warning(f"createLink failed for {filename!r}; using webUrl: {fallback}")
+        log.warning(f"Using item webUrl for {filename!r}: {fallback}")
         return fallback
 
     return None
 
 
 def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
+    if SKIP_UPLOADS:
+        log.debug("SKIP_UPLOADS=true — skipping attachment upload.")
+        return ""
+
     if not msg.get("hasAttachments"):
         return ""
 
@@ -429,7 +487,11 @@ def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
         f"/messages/{msg['id']}/attachments?$select=id,name,contentType"
     )
     try:
-        resp = requests.get(url, headers={"Authorization": f"Bearer {mail_token}"}, timeout=60)
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {mail_token}"},
+            timeout=60,
+        )
         resp.raise_for_status()
         attachments = resp.json().get("value", [])
     except Exception as exc:
@@ -456,23 +518,24 @@ def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
 
     return ", ".join(links)
 
-# ── Subject filter ────────────────────────────────────────────────────────────
-    if not msg.get("hasAttachments"):
-        return ""
-    url = (
-        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
-        f"/messages/{msg['id']}/attachments?$select=name,contentType"
-    )
-    try:
-        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-        resp.raise_for_status()
-        attachments = resp.json().get("value", [])
-        names = [a.get("name", "") for a in attachments if _is_resume(a.get("name", ""))]
-        return ", ".join(names)
-    except Exception as exc:
-        log.warning(f"Could not fetch attachments for {msg['id']}: {exc}")
-        return ""
-# ── Subject filter ────────────────────────────────────────────────────────────
+
+# ── Subject filter ─────────────────────────────────────────────────────────────
+
+# Subjects containing any of these words (case-insensitive) are silently
+# dropped — they are delivery-status / bounce notifications, not profiles.
+SKIP_SUBJECT_RE = re.compile(
+    r"\b(undelivered|undeliverable|delivery\s+failed|delivery\s+status"
+    r"|delivery\s+notification|mail\s+delivery|returned\s+mail"
+    r"|non[- ]?deliverable|bounced?|failed\s+delivery"
+    r"|delivered)\b",
+    re.IGNORECASE,
+)
+
+def _is_skippable_subject(subject: str) -> bool:
+    """Return True if the subject is a delivery-status notification to skip."""
+    return bool(SKIP_SUBJECT_RE.search(subject))
+
+
 SUBJECT_RE = re.compile(
     r"(?<!\S)(?:\[External\]\s*:\s*)?(?P<code>[A-Za-z]{2,4})\s*:",
     re.IGNORECASE,
@@ -534,12 +597,148 @@ def parse_subject(subject: str) -> Optional[tuple[str, str, str, Optional[str]]]
     jr_no, skill = _extract_jr_and_skill(rest)
     return code, company_name, skill, jr_no
 
-# ── HTML table parser ─────────────────────────────────────────────────────────
+
+# ── HTML table parser ──────────────────────────────────────────────────────────
 def _strip_html(text: str) -> str:
+    """Remove all HTML tags."""
     return re.sub(r"<[^>]+>", "", text)
 
 def _clean_cell(text: str) -> str:
-    return re.sub(r"\s+", " ", _strip_html(text)).strip()
+    """
+    Strip HTML tags, decode HTML entities (e.g. &nbsp; → space),
+    then collapse whitespace.
+    """
+    # 1. Decode HTML entities first (&nbsp; &amp; &lt; etc.)
+    text = html_lib.unescape(text)
+    # 2. Remove any remaining HTML tags
+    text = _strip_html(text)
+    # 3. Replace non-breaking spaces (U+00A0) with regular spaces
+    text = text.replace("\u00a0", " ")
+    # 4. Collapse all whitespace to a single space and strip
+    return re.sub(r"\s+", " ", text).strip()
+
+# ── Value sanitisers ───────────────────────────────────────────────────────────
+# contact_number: keep only digits (and leading +). Strip spaces, dashes, etc.
+# email_id      : accept only values that look like a real email address.
+#                 Non-email values (phone numbers, junk) are discarded → None.
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
+_PHONE_RE = re.compile(r"^[\d\s\-\+\(\)]{7,15}$")
+
+def _looks_like_email(val: str) -> bool:
+    return bool(val and _EMAIL_RE.match(val.strip()))
+
+def _looks_like_phone(val: str) -> bool:
+    """True if the value is all digits/spaces/dashes with no @ sign."""
+    return bool(val and _PHONE_RE.match(val.strip()) and "@" not in val)
+
+def _sanitize_contact(val: Optional[str]) -> Optional[str]:
+    """
+    Keep only the numeric digits (and a leading +) from a contact number.
+    Strips spaces, dashes, dots, parentheses and any text.
+    Returns None if nothing numeric remains.
+
+    Examples:
+      '9535389410 &nbsp;'  → '9535389410'
+      '+91-98765-43210'    → '+9198765432​10'
+      'chauhanjay@g.com'   → None  (email address — reject entirely)
+      'N/A'                → None
+    """
+    if not val:
+        return None
+    v = val.strip()
+    # Reject outright if it looks like an email — prevents email→contact bleed
+    if "@" in v:
+        log.warning(f"contact_number contains email address — discarding: {v!r}")
+        return None
+    # Strip everything except digits and a leading +
+    digits = re.sub(r"[^\d+]", "", v)
+    # Remove any + that's not at the very start
+    digits = re.sub(r"(?<!^)\+", "", digits)
+    if len(digits) < 7:
+        # Too short to be a real phone number
+        log.warning(f"contact_number has too few digits after cleaning — discarding: {v!r}")
+        return None
+    return digits or None
+
+def _sanitize_email(val: Optional[str]) -> Optional[str]:
+    """
+    Accept only valid email addresses (must contain @ and a real domain).
+    Rejects plain phone numbers, junk text, and partial values.
+    Returns None if the value is not a recognisable email.
+
+    Also strips any leading/trailing non-alphanumeric junk (e.g. residual
+    &nbsp; that slipped through before HTML decoding) so that values like
+    '&nbsp;agkakde7@gmail.com' are cleaned to 'agkakde7@gmail.com'.
+
+    Examples:
+      'john@gmail.com'          → 'john@gmail.com'
+      '&nbsp;agkakde7@gmail.com'→ 'agkakde7@gmail.com'
+      '9535389410'              → None  (phone number — reject)
+      'john@'                   → None  (incomplete)
+      'not-an-email'            → None
+    """
+    if not val:
+        return None
+    import html as _html
+    # Decode any residual HTML entities, then strip non-printable/junk chars
+    v = _html.unescape(val).strip()
+    # Remove leading non-word characters before the local part (e.g. stray nbsp)
+    v = re.sub(r"^[^\w]+", "", v).strip().lower()
+    if _EMAIL_RE.match(v):
+        return v
+    log.warning(f"email_id value is not a valid email — discarding: {val!r}")
+    return None
+
+def _fix_swapped_contact_email(record: dict) -> dict:
+    """
+    Detect and correct the common case where email ends up in contact_number
+    and a phone number ends up in email_id — caused by ambiguous column headers
+    or column-order mismatches in the source HTML table.
+
+    Cases handled:
+      1. email in contact_number + phone in email_id  → swap both
+      2. email in contact_number + email_id empty     → move to email_id, clear contact_number
+      3. phone in email_id + contact_number empty     → move to contact_number, clear email_id
+    """
+    contact = (record.get("contact_number") or "").strip()
+    email   = (record.get("email_id") or "").strip()
+
+    contact_is_email = _looks_like_email(contact)
+    contact_is_phone = _looks_like_phone(contact)
+    email_is_phone   = _looks_like_phone(email)
+    email_is_email   = _looks_like_email(email)
+
+    # Case 1: both fields contain the wrong type — swap them
+    if contact_is_email and email_is_phone:
+        log.warning(
+            f"Swapped contact/email detected — fixing: "
+            f"contact_number={contact!r}, email_id={email!r}"
+        )
+        record["contact_number"] = email
+        record["email_id"]       = contact
+        return record
+
+    # Case 2: email in contact_number, email_id is blank
+    if contact_is_email and not email:
+        log.warning(
+            f"Email found in contact_number with blank email_id — moving: {contact!r}"
+        )
+        record["email_id"]       = contact
+        record["contact_number"] = None
+        return record
+
+    # Case 3: phone in email_id, contact_number is blank
+    if email_is_phone and not contact:
+        log.warning(
+            f"Phone found in email_id with blank contact_number — moving: {email!r}"
+        )
+        record["contact_number"] = email
+        record["email_id"]       = None
+        return record
+
+    return record
+
 
 def parse_html_table(html: str) -> list[dict]:
     rows: list[dict] = []
@@ -562,7 +761,8 @@ def parse_html_table(html: str) -> list[dict]:
                 rows.append(record)
     return rows
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# ── Misc helpers ───────────────────────────────────────────────────────────────
 def _extract_address(addr_obj: dict) -> str:
     try:
         return addr_obj["emailAddress"]["address"].strip().lower()
@@ -601,12 +801,75 @@ def _t(val) -> Optional[str]:
     v = str(val).strip()
     return v or None
 
-# ── Excel writer ──────────────────────────────────────────────────────────────
-HEADER_FILL  = PatternFill("solid", start_color="1F4E79")
-HEADER_FONT  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-CELL_FONT    = Font(name="Arial", size=10)
-CENTER       = Alignment(horizontal="center", vertical="center", wrap_text=True)
-LEFT         = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+# ── Database helpers ───────────────────────────────────────────────────────────
+def _make_insert_sql() -> pgsql.Composed:
+    return pgsql.SQL(
+        "INSERT INTO {schema}.{table} ({fields}) VALUES ({placeholders})"
+    ).format(
+        schema=pgsql.Identifier(DB_SCHEMA),
+        table=pgsql.Identifier(DB_TABLE),
+        fields=pgsql.SQL(", ").join(map(pgsql.Identifier, DB_COLUMNS)),
+        placeholders=pgsql.SQL(", ").join(pgsql.Placeholder() * len(DB_COLUMNS)),
+    )
+
+
+def _verify_table_columns(conn) -> None:
+    query = """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, (DB_SCHEMA, DB_TABLE))
+        existing = {row[0] for row in cur.fetchall()}
+
+    if not existing:
+        log.error(
+            f"Table {DB_SCHEMA}.{DB_TABLE} not found or no columns returned. "
+            f"Check DB_SCHEMA / DB_TABLE_NAME env vars and DB permissions."
+        )
+        raise SystemExit(1)
+
+    missing = [c for c in DB_COLUMNS if c not in existing]
+    if missing:
+        log.error(
+            f"Columns missing from {DB_SCHEMA}.{DB_TABLE}: {missing}\n"
+            f"  Fix: add the missing columns to the table, or remove them from DB_COLUMNS."
+        )
+        raise SystemExit(1)
+
+    log.info(
+        f"Column pre-flight passed — all {len(DB_COLUMNS)} columns present "
+        f"in {DB_SCHEMA}.{DB_TABLE}."
+    )
+
+
+def insert_records_incremental(conn, records: list[dict]) -> int:
+    insert_sql = _make_insert_sql()
+    inserted = 0
+    for rec in records:
+        row = tuple(rec.get(col) for col in DB_COLUMNS)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(insert_sql, row)
+            conn.commit()
+            inserted += 1
+        except Exception as exc:
+            log.error(
+                f"Row insert failed for candidate "
+                f"{rec.get('name_of_candidate', '?')!r}: {exc}"
+            )
+            conn.rollback()
+    return inserted
+
+
+# ── Excel writer ───────────────────────────────────────────────────────────────
+HEADER_FILL = PatternFill("solid", start_color="1F4E79")
+HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+CELL_FONT   = Font(name="Arial", size=10)
+CENTER      = Alignment(horizontal="center", vertical="center", wrap_text=True)
+LEFT        = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
 COL_WIDTHS = {
     "email_subject": 40, "recruiter": 18, "client_recruiter": 18,
@@ -637,7 +900,7 @@ PRETTY_HEADERS = {
 def write_excel(records: list[dict], output_path: str) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "BS Candidates"
+    ws.title = "Candidates"
     ws.freeze_panes = "A2"
 
     for col_idx, col in enumerate(EXCEL_COLUMNS, 1):
@@ -661,15 +924,14 @@ def write_excel(records: list[dict], output_path: str) -> None:
             cell.alignment = LEFT
             if col == "record_status" and val in STATUS_COLORS:
                 cell.fill = PatternFill("solid", start_color=STATUS_COLORS[val])
-
         ws.row_dimensions[row_idx].height = 16
 
     ws.auto_filter.ref = ws.dimensions
-
     wb.save(output_path)
     log.info(f"Saved {len(records)} row(s) → {output_path}")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 def run() -> None:
     log.info("=== Ad-hoc extractor starting ===")
     log.info(f"Target mailbox : {TARGET_MAILBOX}")
@@ -677,36 +939,58 @@ def run() -> None:
     log.info(f"OneDrive folder: {ONEDRIVE_ARCHIVE_FOLDER}")
     log.info(f"Pulling emails from: {SINCE_DATE} onwards")
     log.info(f"Folder: {INBOX_SUBFOLDER or '(root inbox)'}")
+    log.info(f"DB target: {DB_SCHEMA}.{DB_TABLE}")
+    log.info(f"Skip uploads: {SKIP_UPLOADS}")
 
     mail_token = get_mail_token()
     od_token   = get_onedrive_token()
     log.info("Tokens obtained.")
 
-    # Verify OneDrive access and ensure target folder exists
-    _drive_check = requests.get(
-        "https://graph.microsoft.com/v1.0/me/drive",
-        headers={"Authorization": f"Bearer {od_token}"},
-        timeout=30,
-    )
-    if _drive_check.status_code == 200:
-        log.info(f"OneDrive access confirmed for {ONEDRIVE_USER}.")
-        if ONEDRIVE_ARCHIVE_FOLDER:
-            _ensure_onedrive_folder(od_token, ONEDRIVE_ARCHIVE_FOLDER)
-    else:
-        log.warning(
-            f"OneDrive access check returned {_drive_check.status_code} for "
-            f"{ONEDRIVE_USER} — attachment uploads may fail. "
-            f"Response: {_drive_check.text[:200]}"
+    if not SKIP_UPLOADS:
+        _drive_check = requests.get(
+            "https://graph.microsoft.com/v1.0/me/drive",
+            headers={"Authorization": f"Bearer {od_token}"},
+            timeout=30,
         )
+        if _drive_check.status_code == 200:
+            log.info(f"OneDrive access confirmed for {ONEDRIVE_USER}.")
+            if ONEDRIVE_ARCHIVE_FOLDER:
+                _ensure_onedrive_folder(od_token, ONEDRIVE_ARCHIVE_FOLDER)
+        else:
+            log.warning(
+                f"OneDrive access check returned {_drive_check.status_code} — "
+                f"attachment uploads may fail. Response: {_drive_check.text[:200]}"
+            )
+    else:
+        log.info("Skipping OneDrive drive check (SKIP_UPLOADS=true).")
+
+    try:
+        db_conn = psycopg2.connect(DB_DSN)
+        db_conn.autocommit = False
+        log.info("DB connection opened.")
+        _verify_table_columns(db_conn)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        log.error(f"Cannot connect to DB: {exc} — records will NOT be inserted.")
+        db_conn = None
 
     folder_id = resolve_folder_id(mail_token, INBOX_SUBFOLDER) if INBOX_SUBFOLDER else None
     emails    = fetch_bs_emails(mail_token, folder_id)
 
     records: list[dict] = []
-    skipped = 0
+    skipped  = 0
+    db_count = 0
 
     for msg in emails:
         subject = msg.get("subject", "").strip()
+
+        # Skip delivery-status / bounce notifications before anything else
+        if _is_skippable_subject(subject):
+            log.info(f"Skipping delivery-status email: {subject!r}")
+            skipped += 1
+            continue
+
         parsed  = parse_subject(subject)
         if parsed is None:
             skipped += 1
@@ -742,6 +1026,8 @@ def run() -> None:
             except ValueError:
                 pass
 
+        email_records: list[dict] = []
+
         for row in rows:
             row_date = _parse_date(row["date"]) if row.get("date") else None
             if row_date is None:
@@ -749,8 +1035,9 @@ def run() -> None:
 
             effective_jr_no = _t(row.get("jr_no")) or subject_jr_no
             candidate_name  = _t(row.get("name_of_candidate"))
-            contact_number  = _t(row.get("contact_number"))
-            email_id_val    = _t(row.get("email_id"))
+            # Sanitise: contact_number → digits only; email_id → valid email only
+            contact_number  = _sanitize_contact(_t(row.get("contact_number")))
+            email_id_val    = _sanitize_email(_t(row.get("email_id")))
 
             record = {
                 "email_subject":       subject,
@@ -776,31 +1063,58 @@ def run() -> None:
                 "preferred_location":  _t(row.get("preferred_location")),
                 "attachment":          _t(attachment_str),
                 "remarks":             _t(row.get("remarks")),
-                "record_status":       _record_status({
-                    "name_of_candidate": candidate_name,
-                    "contact_number":    contact_number,
-                    "email_id":          email_id_val,
-                    "general_skill":     _t(general_skill),
-                    "company_name":      company_name,
-                    "recruiter":         recruiter,
-                    "email_from":        from_addr,
-                    "email_to":          to_addr,
-                }),
             }
+
+            # ── Fix swapped contact/email fields before status check ───────
+            record = _fix_swapped_contact_email(record)
+
+            record["record_status"] = _record_status({
+                "name_of_candidate": record.get("name_of_candidate"),
+                "contact_number":    record.get("contact_number"),
+                "email_id":          record.get("email_id"),
+                "general_skill":     _t(general_skill),
+                "company_name":      company_name,
+                "recruiter":         recruiter,
+                "email_from":        from_addr,
+                "email_to":          to_addr,
+            })
+
             records.append(record)
+            email_records.append(record)
             log.info(f"  + {candidate_name or '(unknown)'} | {subject!r} | {row_date}")
 
+        if email_records and db_conn is not None:
+            n = insert_records_incremental(db_conn, email_records)
+            db_count += n
+            log.info(
+                f"  DB committed {n}/{len(email_records)} row(s) for: {subject!r} "
+                f"(running total: {db_count})"
+            )
+
+    if db_conn is not None:
+        try:
+            db_conn.close()
+            log.info("DB connection closed.")
+        except Exception:
+            pass
+
     log.info(f"Skipped {skipped} email(s) with no recognized company code.")
-    log.info(f"Total rows to write: {len(records)}")
+    log.info(f"Total rows collected  : {len(records)}")
+    log.info(f"Total DB rows inserted: {db_count}")
 
     if not records:
-        log.warning("No matching records found. No Excel file written.")
+        log.warning("No matching records found. Nothing to write.")
         return
 
     ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = f"adhoc_candidates_{ts}.xlsx"
     write_excel(records, output_path)
-    print(f"\n✅  Done — {len(records)} row(s) written to: {output_path}\n")
+
+    print(
+        f"\n✅  Done — {len(records)} row(s) processed.\n"
+        f"    DB rows inserted : {db_count}\n"
+        f"    Excel output     : {output_path}\n"
+    )
 
 
 if __name__ == "__main__":

@@ -58,7 +58,7 @@ AZURE_CLIENT_SECRET = os.environ["AZURE_CLIENT_SECRET"]
 
 OD_TENANT_ID        = os.environ["OD_TENANT_ID"]
 OD_CLIENT_ID        = os.environ["OD_CLIENT_ID"]
-OD_CLIENT_SECRET    = os.environ.get("OD_CLIENT_SECRET", "")  # kept for compat, not used
+OD_CLIENT_SECRET    = os.environ.get("OD_CLIENT_SECRET", "")
 OD_REFRESH_TOKEN    = os.environ["OD_REFRESH_TOKEN"]
 
 TARGET_MAILBOX      = os.environ["TARGET_MAILBOX"]
@@ -78,6 +78,17 @@ RESUME_EXTENSIONS   = {".pdf", ".doc", ".docx"}
 # Number of months of history to consider when checking for duplicates.
 DUPLICATE_CHECK_MONTHS = int(os.environ.get("DUPLICATE_CHECK_MONTHS", "3"))
 
+# Optional end-date filter: only emails received on or before this date are
+# processed.  Format: YYYY-MM-DD.  Defaults to today when not set.
+# Example: END_DATE=2025-04-20 → reads emails from today back to 2025-04-20.
+_end_date_raw = os.environ.get("END_DATE", "").strip()
+try:
+    END_DATE: date = datetime.strptime(_end_date_raw, "%Y-%m-%d").date() if _end_date_raw else date.today()
+except ValueError:
+    raise SystemExit(
+        f"END_DATE env var '{_end_date_raw}' is not a valid YYYY-MM-DD date."
+    )
+
 # Fields that may be auto-filled when NULL/empty in an existing record.
 UPDATABLE_FIELDS = [
     "jr_no",
@@ -87,25 +98,6 @@ UPDATABLE_FIELDS = [
     "current_location", "preferred_location",
     "attachment", "remarks",
 ]
-
-
-# ─── Company code → full name ──────────────────────────────────────────────────
-COMPANY_CODES: dict[str, str] = {
-    "BS":  "Birlasoft",
-    "BW":  "BeWealthy",
-    "TCS": "TCS",
-    "INF": "Infosys",
-    "WIP": "Wipro",
-    "HCL": "HCL Technologies",
-    "ACC": "Accenture",
-    "CAP": "Capgemini",
-    "COG": "Cognizant",
-    "IBM": "IBM",
-    "SAP": "SAP",
-    "ORC": "Oracle",
-    "MS":  "Microsoft",
-    "RS":  "RS Software",
-}
 
 
 # ─── Fuzzy column-header aliases ───────────────────────────────────────────────
@@ -133,11 +125,11 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "current_org": [
         "current company", "current_company", "company", "employer",
         "current employer", "current_employer", "current org", "current_org",
-        "organisation", "organization", "curr company", "present company",
+        "organisation", "organization", "curr company", "present company", "curr org"
     ],
     "total_experience": [
         "total experience", "total_experience", "total exp", "total_exp",
-        "experience", "exp", "total yrs", "total years",
+        "experience", "exp", "total yrs", "total years", "tot exp"
     ],
     "relevant_experience": [
         "relevant experience", "relevant_experience", "relevant exp",
@@ -145,7 +137,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     ],
     "current_ctc": [
         "current ctc", "current_ctc", "ctc", "current salary",
-        "current_salary", "present ctc", "present_ctc", "curr ctc",
+        "current_salary", "present ctc", "present_ctc", "curr ctc", "Rates"
     ],
     "expected_ctc": [
         "expected ctc", "expected_ctc", "expected salary", "expected_salary",
@@ -157,12 +149,12 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     ],
     "current_location": [
         "current location", "current_location", "location", "city",
-        "current city", "current_city", "present location",
+        "current city", "current_city", "present location", "curr loc",
     ],
     "preferred_location": [
         "preferred location", "preferred_location", "preferred city",
         "preferred_city", "pref location", "pref_location",
-        "willing to relocate", "target location",
+        "willing to relocate", "target location", "exc loc"
     ],
     "date": [
         "date", "submission date", "submission_date", "applied date",
@@ -286,9 +278,25 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
     return None
 
 
-# ─── Fetch & mark emails ───────────────────────────────────────────────────────
-def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> list[dict]:
+# ─── Fetch emails ──────────────────────────────────────────────────────────────
+def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None, end_date: Optional[date] = None) -> list[dict]:
+    """
+    Fetch emails page by page WITHOUT expanding attachments inline.
+
+    Expanding attachments ($expand=attachments) causes response payloads to
+    balloon to tens of MB on large mailboxes, which triggers the Graph API
+    gateway to cancel the request with "The operation was canceled."
+
+    Attachments are fetched separately per message on demand inside
+    upload_attachments() → _fetch_attachment_content().
+
+    end_date: if provided, only emails received on or before this date (up to
+    23:59:59 UTC of that day) are fetched via a Graph API $filter.  Emails are
+    always ordered newest-first, so pagination stops as soon as an email older
+    than the window is encountered.
+    """
     headers = {"Authorization": f"Bearer {token}"}
+
     if folder_id:
         base = (
             f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
@@ -297,12 +305,28 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
     else:
         base = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages"
 
+    # Page size capped at 50 — keeps individual responses small and avoids
+    # gateway timeouts that occur with larger pages on busy mailboxes.
+    # $expand=attachments is intentionally omitted — see docstring above.
+    #
+    # Date filter: Graph API uses ISO-8601 datetimes in UTC.
+    # We filter receivedDateTime between end_date 00:00:00 UTC and today
+    # 23:59:59 UTC so the full date range is included.
+    _today_iso    = datetime.utcnow().strftime("%Y-%m-%dT23:59:59Z")
+    _end_date_iso = (
+        f"{end_date.strftime('%Y-%m-%d')}T00:00:00Z"
+        if end_date else "1970-01-01T00:00:00Z"
+    )
+    _date_filter = (
+        f"receivedDateTime ge {_end_date_iso}"
+        f" and receivedDateTime le {_today_iso}"
+    )
     url = (
         f"{base}"
-        f"?$top={top}"
+        f"?$top=50"
         f"&$select=id,subject,from,toRecipients,ccRecipients,"
         f"body,receivedDateTime,isRead,hasAttachments"
-        f"&$expand=attachments($select=id,name,contentType,size)"
+        f"&$filter={requests.utils.quote(_date_filter)}"
         f"&$orderby=receivedDateTime desc"
     )
 
@@ -310,17 +334,36 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
     page = 0
     while url:
         page += 1
-        log.info(f"Fetching page {page} — {url[:80]}...")
-        resp = requests.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        log.info(f"Fetching page {page}…")
+        try:
+            resp = requests.get(url, headers=headers, timeout=90)
+            resp.raise_for_status()
+        except requests.exceptions.Timeout:
+            log.error(
+                f"Timeout on page {page} — stopping pagination early. "
+                f"Got {len(all_emails)} email(s) so far."
+            )
+            break
+        except requests.exceptions.RequestException as exc:
+            log.error(
+                f"Request error on page {page}: {exc} — stopping pagination early. "
+                f"Got {len(all_emails)} email(s) so far."
+            )
+            break
+
+        data  = resp.json()
         batch = data.get("value", [])
         all_emails.extend(batch)
-        log.info(f"  Page {page}: got {len(batch)} email(s) (total so far: {len(all_emails)})")
-        url = data.get("@odata.nextLink")  # None when no more pages
+        log.info(f"  Page {page}: {len(batch)} email(s) (total so far: {len(all_emails)})")
+
+        if len(all_emails) >= top:
+            log.info(f"Reached LIMIT={top} — stopping pagination.")
+            break
+
+        url = data.get("@odata.nextLink")
 
     log.info(f"Fetched {len(all_emails)} email(s) total across {page} page(s).")
-    return all_emails
+    return all_emails[:top]
 
 
 def mark_email_read(token: str, message_id: str) -> None:
@@ -350,11 +393,8 @@ _JR_PATTERNS = [
     re.compile(r"\b(?P<jr>\d{4,})\b",                                      re.IGNORECASE),
 ]
 
-# Leftover "Jr." / "Jr. No." stub after the number has been extracted
 _JR_STUB_RE = re.compile(r"\bjr\.?\s*(?:no\.?)?\s*$", re.IGNORECASE)
 
-# Filler phrases: "Profile(s) for [the]", "Profiles of [the]",
-#                 "Sharing profile", "CV for [the]", "Resume for [the]", etc.
 _SKILL_FILLER_RE = re.compile(
     r"\b(?:profiles?\s+for\s+(?:the\s+)?"
     r"|profiles?\s+of\s+(?:the\s+)?"
@@ -377,19 +417,29 @@ def _extract_jr_and_skill(rest: str) -> tuple[Optional[str], str]:
             jr_no = m.group("jr")
             start, end = m.span()
             rest = (rest[:start] + " " + rest[end:]).strip()
-            # Remove separators and bare "Jr."/"Jr. No." stubs left behind
             rest = re.sub(r"^[-|.\s]+|[-|.\s]+$", "", rest).strip()
             rest = _JR_STUB_RE.sub("", rest).strip()
             rest = re.sub(r"[-|.\s]+$", "", rest).strip()
             break
 
-    # Strip filler phrases, then clean up remaining separators
     rest = _SKILL_FILLER_RE.sub("", rest).strip()
     rest = re.sub(r"^[-|.\s]+|[-|.\s]+$", "", rest).strip()
     return jr_no, re.sub(r"\s{2,}", " ", rest).strip()
 
 
 def parse_subject(subject: str) -> Optional[tuple[str, str, Optional[str]]]:
+    """
+    Parse a subject line of the form "CODE: <skill> [- JR12345]".
+
+    Returns (company_name, general_skill, jr_no).
+
+    company_name is the raw subject code exactly as written (e.g. "TCS", "BS",
+    "NEWCO"). We do NOT look up a hardcoded code→name table because the list of
+    client companies is open-ended; an unknown code would otherwise silently
+    produce the wrong value or get swallowed.
+
+    Returns None for FW/RE threads or unrecognised subject formats.
+    """
     subject = subject.strip()
     if IGNORE_RE.match(subject):
         log.debug(f"Skip — FW/RE: {subject!r}")
@@ -398,10 +448,12 @@ def parse_subject(subject: str) -> Optional[tuple[str, str, Optional[str]]]:
     if not m:
         log.debug(f"Skip — no pattern match: {subject!r}")
         return None
-    code  = m.group("code").upper()
+
+    # Use the raw code as-is — no lookup table
+    company_name = m.group("code").upper()
     jr_no, skill = _extract_jr_and_skill(m.group("rest"))
-    log.debug(f"Parsed subject → code={code} skill={skill!r} jr_no={jr_no!r}")
-    return code, skill, jr_no
+    log.debug(f"Parsed subject → company={company_name!r} skill={skill!r} jr_no={jr_no!r}")
+    return company_name, skill, jr_no
 
 
 # ─── HTML table parser ─────────────────────────────────────────────────────────
@@ -458,7 +510,6 @@ def _ensure_onedrive_folder(od_token: str, folder_name: str) -> None:
         "Authorization": f"Bearer {od_token}",
         "Content-Type": "application/json",
     }
-    # Check if folder already exists
     check = requests.get(
         f"https://graph.microsoft.com/v1.0/me/drive/root:/{folder_name}",
         headers=headers,
@@ -468,7 +519,6 @@ def _ensure_onedrive_folder(od_token: str, folder_name: str) -> None:
         log.info(f"OneDrive folder '{folder_name}' already exists.")
         return
 
-    # Create it
     resp = requests.post(
         "https://graph.microsoft.com/v1.0/me/drive/root/children",
         headers=headers,
@@ -494,36 +544,30 @@ def _fetch_attachment_content(mail_token: str, message_id: str, attachment_id: s
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
         f"/messages/{message_id}/attachments/{attachment_id}/$value"
     )
-    resp = requests.get(url, headers={"Authorization": f"Bearer {mail_token}"}, timeout=60)
+    resp = requests.get(url, headers={"Authorization": f"Bearer {mail_token}"}, timeout=120)
     resp.raise_for_status()
     return resp.content
 
 
 def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optional[str]:
-    """
-    Upload a resume file to ONEDRIVE_USER's personal OneDrive using a
-    delegated access token. The HR Resumes folder is created by
-    _ensure_onedrive_folder() at startup so it always exists by the time
-    this function is called.
-    """
-    if ONEDRIVE_FOLDER:
-        remote_path = f"{ONEDRIVE_FOLDER}/{filename}"
-    else:
-        remote_path = filename
+    """Upload a resume file to ONEDRIVE_USER's personal OneDrive."""
+    remote_path = f"{ONEDRIVE_FOLDER}/{filename}" if ONEDRIVE_FOLDER else filename
+    upload_url  = f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/content"
 
-    upload_url = (
-        f"https://graph.microsoft.com/v1.0/me/drive/root:/{remote_path}:/content"
-    )
+    try:
+        resp = requests.put(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {od_token}",
+                "Content-Type": "application/octet-stream",
+            },
+            data=content,
+            timeout=120,
+        )
+    except requests.exceptions.Timeout:
+        log.error(f"OneDrive upload timed out for {filename!r}")
+        return None
 
-    resp = requests.put(
-        upload_url,
-        headers={
-            "Authorization": f"Bearer {od_token}",
-            "Content-Type": "application/octet-stream",
-        },
-        data=content,
-        timeout=120,
-    )
     if resp.status_code not in (200, 201):
         log.error(
             f"OneDrive upload failed for {filename!r}: "
@@ -534,26 +578,27 @@ def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optiona
     item    = resp.json()
     item_id = item.get("id")
 
-    # Create a shareable link
-    link_resp = requests.post(
-        f"https://graph.microsoft.com/v1.0/me/drive/items/{item_id}/createLink",
-        headers={
-            "Authorization": f"Bearer {od_token}",
-            "Content-Type": "application/json",
-        },
-        json={"type": "view", "scope": "organization"},
-        timeout=30,
-    )
-    if link_resp.status_code in (200, 201):
-        web_url = link_resp.json().get("link", {}).get("webUrl", "")
-        if web_url:
-            log.info(f"  ↑ Uploaded {filename!r} → {web_url}")
-            return web_url
+    try:
+        link_resp = requests.post(
+            f"https://graph.microsoft.com/v1.0/me/drive/items/{item_id}/createLink",
+            headers={
+                "Authorization": f"Bearer {od_token}",
+                "Content-Type": "application/json",
+            },
+            json={"type": "view", "scope": "organization"},
+            timeout=30,
+        )
+        if link_resp.status_code in (200, 201):
+            web_url = link_resp.json().get("link", {}).get("webUrl", "")
+            if web_url:
+                log.info(f"  ↑ Uploaded {filename!r} → {web_url}")
+                return web_url
+    except Exception as exc:
+        log.warning(f"createLink failed for {filename!r}: {exc}")
 
-    # Fall back to item's own webUrl if createLink fails
     fallback = item.get("webUrl", "")
     if fallback:
-        log.warning(f"createLink failed for {filename!r}; using webUrl: {fallback}")
+        log.warning(f"createLink failed for {filename!r}; using item webUrl: {fallback}")
         return fallback
 
     return None
@@ -561,11 +606,29 @@ def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optiona
 
 def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
     """
-    Download resume attachments from email (mail_token + TARGET_MAILBOX)
-    and upload them to OneDrive (od_token scoped to ONEDRIVE_USER via /me/drive).
+    Fetch resume attachments on demand and upload them to OneDrive.
+
+    Attachments are NOT expanded inline during the email list fetch (which
+    would balloon response sizes). Instead they are fetched here per message
+    using the /attachments endpoint, only when hasAttachments is True.
     """
-    attachments = msg.get("attachments") or []
-    if not attachments:
+    if not msg.get("hasAttachments"):
+        return ""
+
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
+        f"/messages/{msg['id']}/attachments?$select=id,name,contentType"
+    )
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {mail_token}"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        attachments = resp.json().get("value", [])
+    except Exception as exc:
+        log.warning(f"Could not fetch attachment list for {msg['id']}: {exc}")
         return ""
 
     links: list[str] = []
@@ -931,16 +994,16 @@ def insert_record(cur, data: dict) -> bool:
 # ─── Date parsing ──────────────────────────────────────────────────────────────
 _DATE_FORMATS = (
     "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y",
-    "%d-%b-%y", "%d-%b-%Y",   # 24-Apr-26, 24-Apr-2026
-    "%b-%d-%Y", "%b-%d-%y",   # Apr-24-2026, Apr-24-26
-    "%d/%b/%Y", "%d/%b/%y",   # 24/Apr/2026, 24/Apr/26
-    "%d %b %Y", "%d %b %y",   # 24 Apr 2026, 24 Apr 26
-    "%b %d %Y", "%b %d %y",   # Apr 24 2026, Apr 24 26
-    "%d-%B-%y", "%d-%B-%Y",   # 24-April-26, 24-April-2026
-    "%B-%d-%Y", "%B-%d-%y",   # April-24-2026, April-24-26
-    "%d/%B/%Y", "%d/%B/%y",   # 24/April/2026, 24/April/26
-    "%d %B %Y", "%d %B %y",   # 24 April 2026, 24 April 26
-    "%B %d %Y", "%B %d %y",   # April 24 2026, April 24 26
+    "%d-%b-%y", "%d-%b-%Y",
+    "%b-%d-%Y", "%b-%d-%y",
+    "%d/%b/%Y", "%d/%b/%y",
+    "%d %b %Y", "%d %b %y",
+    "%b %d %Y", "%b %d %y",
+    "%d-%B-%y", "%d-%B-%Y",
+    "%B-%d-%Y", "%B-%d-%y",
+    "%d/%B/%Y", "%d/%B/%y",
+    "%d %B %Y", "%d %B %y",
+    "%B %d %Y", "%B %d %y",
 )
 
 
@@ -960,12 +1023,12 @@ def process_emails() -> None:
     log.info(f"OneDrive user  : {ONEDRIVE_USER}")
     log.info(f"OneDrive folder: {ONEDRIVE_FOLDER}")
     log.info(f"Inbox subfolder: {INBOX_SUBFOLDER or '(root inbox)'}")
+    log.info(f"Date filter    : {END_DATE} → today ({date.today()})")
 
     token    = get_mail_token()
     od_token = get_onedrive_token()
     log.info("Tokens obtained.")
 
-    # Verify OneDrive access and ensure target folder exists
     _drive_check = requests.get(
         "https://graph.microsoft.com/v1.0/me/drive",
         headers={"Authorization": f"Bearer {od_token}"},
@@ -991,7 +1054,7 @@ def process_emails() -> None:
     ensure_tables(cur)
     conn.commit()
 
-    emails = fetch_emails(token, top=Limit, folder_id=inbox_folder_id)
+    emails = fetch_emails(token, top=Limit, folder_id=inbox_folder_id, end_date=END_DATE)
 
     processed = skipped = inserted = updated = conflicts = errors = 0
 
@@ -1012,6 +1075,8 @@ def process_emails() -> None:
             mark_email_read(token, msg["id"])
             continue
 
+        # parse_subject returns (company_name, general_skill, jr_no)
+        # company_name is the raw subject code — no lookup table applied
         company_name, general_skill, subject_jr_no = parsed
 
         from_addr = _extract_address(msg.get("from", {}))
