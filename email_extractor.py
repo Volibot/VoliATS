@@ -78,6 +78,17 @@ RESUME_EXTENSIONS   = {".pdf", ".doc", ".docx"}
 # Number of months of history to consider when checking for duplicates.
 DUPLICATE_CHECK_MONTHS = int(os.environ.get("DUPLICATE_CHECK_MONTHS", "3"))
 
+# Optional end-date filter: only emails received on or before this date are
+# processed.  Format: YYYY-MM-DD.  Defaults to today when not set.
+# Example: END_DATE=2025-04-20 → reads emails from today back to 2025-04-20.
+_end_date_raw = os.environ.get("END_DATE", "").strip()
+try:
+    END_DATE: date = datetime.strptime(_end_date_raw, "%Y-%m-%d").date() if _end_date_raw else date.today()
+except ValueError:
+    raise SystemExit(
+        f"END_DATE env var '{_end_date_raw}' is not a valid YYYY-MM-DD date."
+    )
+
 # Fields that may be auto-filled when NULL/empty in an existing record.
 UPDATABLE_FIELDS = [
     "jr_no",
@@ -268,7 +279,7 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
 
 
 # ─── Fetch emails ──────────────────────────────────────────────────────────────
-def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> list[dict]:
+def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None, end_date: Optional[date] = None) -> list[dict]:
     """
     Fetch emails page by page WITHOUT expanding attachments inline.
 
@@ -278,6 +289,11 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
 
     Attachments are fetched separately per message on demand inside
     upload_attachments() → _fetch_attachment_content().
+
+    end_date: if provided, only emails received on or before this date (up to
+    23:59:59 UTC of that day) are fetched via a Graph API $filter.  Emails are
+    always ordered newest-first, so pagination stops as soon as an email older
+    than the window is encountered.
     """
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -292,11 +308,25 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
     # Page size capped at 50 — keeps individual responses small and avoids
     # gateway timeouts that occur with larger pages on busy mailboxes.
     # $expand=attachments is intentionally omitted — see docstring above.
+    #
+    # Date filter: Graph API uses ISO-8601 datetimes in UTC.
+    # We filter receivedDateTime between end_date 00:00:00 UTC and today
+    # 23:59:59 UTC so the full date range is included.
+    _today_iso    = datetime.utcnow().strftime("%Y-%m-%dT23:59:59Z")
+    _end_date_iso = (
+        f"{end_date.strftime('%Y-%m-%d')}T00:00:00Z"
+        if end_date else "1970-01-01T00:00:00Z"
+    )
+    _date_filter = (
+        f"receivedDateTime ge {_end_date_iso}"
+        f" and receivedDateTime le {_today_iso}"
+    )
     url = (
         f"{base}"
         f"?$top=50"
         f"&$select=id,subject,from,toRecipients,ccRecipients,"
         f"body,receivedDateTime,isRead,hasAttachments"
+        f"&$filter={requests.utils.quote(_date_filter)}"
         f"&$orderby=receivedDateTime desc"
     )
 
@@ -993,6 +1023,7 @@ def process_emails() -> None:
     log.info(f"OneDrive user  : {ONEDRIVE_USER}")
     log.info(f"OneDrive folder: {ONEDRIVE_FOLDER}")
     log.info(f"Inbox subfolder: {INBOX_SUBFOLDER or '(root inbox)'}")
+    log.info(f"Date filter    : {END_DATE} → today ({date.today()})")
 
     token    = get_mail_token()
     od_token = get_onedrive_token()
@@ -1023,7 +1054,7 @@ def process_emails() -> None:
     ensure_tables(cur)
     conn.commit()
 
-    emails = fetch_emails(token, top=Limit, folder_id=inbox_folder_id)
+    emails = fetch_emails(token, top=Limit, folder_id=inbox_folder_id, end_date=END_DATE)
 
     processed = skipped = inserted = updated = conflicts = errors = 0
 

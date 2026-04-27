@@ -1,7 +1,7 @@
 """
 Ad-hoc extractor: pulls candidate emails from "Company Profiles" subfolder
 received on or after 2026-01-01, writes parsed fields to the
-`temp_hrvolibit_archive` PostgreSQL table, and saves an Excel report.
+`public.temp_hrvolibit_archive` PostgreSQL table, and saves an Excel report.
 
 Subject filters accepted:
   - CODE: ...
@@ -18,13 +18,13 @@ Required env vars:
   DB_DSN
 
 Optional:
-  AZURE_CLIENT_SECRET   (app secret)
-  OD_CLIENT_SECRET      (OneDrive secret — can be empty for public apps)
-  INBOX_SUBFOLDER       (default: "Company Profiles")
-  DB_TABLE_NAME         (default: "temp_hrvolibit_archive")
+  OD_CLIENT_SECRET        (OneDrive secret — can be empty for public apps)
+  INBOX_SUBFOLDER         (default: "Company Profiles")
+  DB_SCHEMA               (default: "public")
+  DB_TABLE_NAME           (default: "temp_hrvolibit_archive")
   ONEDRIVE_ARCHIVE_FOLDER (default: "archive")
-  LIMIT                 (default: 100)
-  SKIP_UPLOADS          (default: false — set to "true" to skip OneDrive uploads)
+  LIMIT                   (default: 100)
+  SKIP_UPLOADS            (default: false — set "true" to skip OneDrive uploads)
 
 ── Local run ────────────────────────────────────────────────────────────────────
 1. Install dependencies:
@@ -53,7 +53,7 @@ import logging
 import requests
 import psycopg2
 from psycopg2 import sql as pgsql
-from datetime import datetime, date, timezone
+from datetime import datetime, date
 from typing import Optional
 
 import openpyxl
@@ -63,7 +63,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -87,12 +87,16 @@ OD_CLIENT_SECRET        = os.environ.get("OD_CLIENT_SECRET", "")
 OD_REFRESH_TOKEN        = os.environ["OD_REFRESH_TOKEN"]
 ONEDRIVE_USER           = os.environ["ONEDRIVE_USER"]
 DB_DSN                  = os.environ["DB_DSN"]
-DB_TABLE                = "temp_hrvolibit_archive"
+
+# Schema + table always explicit — never rely on search_path
+DB_SCHEMA = os.environ.get("DB_SCHEMA", "public")
+DB_TABLE  = os.environ.get("DB_TABLE_NAME", "temp_hrvolibit_archive")
+
 ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "archive")
 LIMIT                   = int(os.environ.get("LIMIT", "100"))
 
-# Set SKIP_UPLOADS=true in env to bypass OneDrive uploads (useful for catch-up runs)
-SKIP_UPLOADS = os.environ.get("SKIP_UPLOADS", "false")
+# Set SKIP_UPLOADS=true to skip OneDrive uploads (faster catch-up runs)
+SKIP_UPLOADS = os.environ.get("SKIP_UPLOADS", "false").lower() == "true"
 
 COMPANY_CODES: dict[str, str] = {
     "BS":  "Birlasoft",
@@ -123,6 +127,36 @@ EXCEL_COLUMNS = [
     "current_ctc", "expected_ctc", "notice_period",
     "current_org", "current_location", "preferred_location",
     "attachment", "remarks", "record_status",
+]
+
+# ── DB columns — must exactly match public.temp_hrvolibit_archive ─────────────
+# Excludes auto-managed columns: id, created_date, modified_date,
+# created_by, modified_by, is_duplicate, final_status, status
+DB_COLUMNS = [
+    "email_subject",
+    "recruiter",
+    "client_recruiter",
+    "email_from",
+    "email_to",
+    "delivery_type",
+    "company_name",
+    "general_skill",
+    "date",
+    "jr_no",
+    "name_of_candidate",
+    "contact_number",
+    "email_id",
+    "total_experience",
+    "relevant_experience",
+    "current_ctc",
+    "expected_ctc",
+    "notice_period",
+    "current_org",
+    "current_location",
+    "preferred_location",
+    "attachment",
+    "remarks",
+    "record_status",
 ]
 
 # ── Column aliases ─────────────────────────────────────────────────────────────
@@ -230,7 +264,7 @@ def _resolve_header(raw: str) -> Optional[str]:
     return ALIAS_MAP.get(_normalize(raw))
 
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Auth ───────────────────────────────────────────────────────────────────────
 def _get_app_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     result = ConfidentialClientApplication(
         client_id,
@@ -249,10 +283,6 @@ def get_mail_token() -> str:
 
 
 def get_onedrive_token() -> str:
-    """
-    Delegated token via stored refresh token.
-    Refresh tokens last ~90 days — re-run generate_refresh_token.py before expiry.
-    """
     app = PublicClientApplication(
         OD_CLIENT_ID,
         authority=f"https://login.microsoftonline.com/{OD_TENANT_ID}",
@@ -270,7 +300,7 @@ def get_onedrive_token() -> str:
     return result["access_token"]
 
 
-# ── Folder resolution ─────────────────────────────────────────────────────────
+# ── Folder resolution ──────────────────────────────────────────────────────────
 def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
     if not folder_name:
         return None
@@ -299,7 +329,7 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
     return None
 
 
-# ── Fetch emails (paginated, filtered by date) ────────────────────────────────
+# ── Fetch emails ───────────────────────────────────────────────────────────────
 def fetch_bs_emails(token: str, folder_id: Optional[str]) -> list[dict]:
     headers = {"Authorization": f"Bearer {token}"}
     since_iso = f"{SINCE_DATE.isoformat()}T00:00:00Z"
@@ -329,10 +359,10 @@ def fetch_bs_emails(token: str, folder_id: Optional[str]) -> list[dict]:
             resp = requests.get(url, headers=headers, timeout=90)
             resp.raise_for_status()
         except requests.exceptions.Timeout:
-            log.error(f"Timeout on page {page} — stopping pagination. Got {len(all_emails)} emails so far.")
+            log.error(f"Timeout on page {page} — stopping. Got {len(all_emails)} emails so far.")
             break
         except requests.exceptions.RequestException as exc:
-            log.error(f"Request error on page {page}: {exc} — stopping pagination.")
+            log.error(f"Request error on page {page}: {exc} — stopping.")
             break
 
         data = resp.json()
@@ -345,7 +375,7 @@ def fetch_bs_emails(token: str, folder_id: Optional[str]) -> list[dict]:
     return all_emails
 
 
-# ── OneDrive attachment helpers ──────────────────────────────────────────────
+# ── OneDrive attachment helpers ────────────────────────────────────────────────
 def _is_resume(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in RESUME_EXTENSIONS
 
@@ -377,7 +407,6 @@ def _ensure_onedrive_folder(od_token: str, folder_name: str) -> None:
     if check.status_code == 200:
         log.info(f"OneDrive folder '{folder_name}' already exists.")
         return
-
     resp = requests.post(
         "https://graph.microsoft.com/v1.0/me/drive/root/children",
         headers=headers,
@@ -450,11 +479,6 @@ def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optiona
 
 
 def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
-    """
-    Fetch resume attachments from the email, upload to OneDrive, return
-    a comma-separated string of share links (or filenames on failure).
-    Returns "" if the email has no attachments or SKIP_UPLOADS is set.
-    """
     if SKIP_UPLOADS:
         log.debug("SKIP_UPLOADS=true — skipping attachment upload.")
         return ""
@@ -499,7 +523,7 @@ def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
     return ", ".join(links)
 
 
-# ── Subject filter ────────────────────────────────────────────────────────────
+# ── Subject filter ─────────────────────────────────────────────────────────────
 SUBJECT_RE = re.compile(
     r"(?<!\S)(?:\[External\]\s*:\s*)?(?P<code>[A-Za-z]{2,4})\s*:",
     re.IGNORECASE,
@@ -538,7 +562,7 @@ def parse_subject(subject: str) -> Optional[tuple[str, str, str, Optional[str]]]
     return code, company_name, skill, jr_no
 
 
-# ── HTML table parser ─────────────────────────────────────────────────────────
+# ── HTML table parser ──────────────────────────────────────────────────────────
 def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
@@ -567,7 +591,7 @@ def parse_html_table(html: str) -> list[dict]:
     return rows
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Misc helpers ───────────────────────────────────────────────────────────────
 def _extract_address(addr_obj: dict) -> str:
     try:
         return addr_obj["emailAddress"]["address"].strip().lower()
@@ -607,31 +631,64 @@ def _t(val) -> Optional[str]:
     return v or None
 
 
-# ── Database helpers ──────────────────────────────────────────────────────────
-DB_COLUMNS = [
-    "email_subject", "recruiter", "client_recruiter", "email_from", "email_to",
-    "delivery_type", "company_name", "general_skill", "date", "jr_no",
-    "name_of_candidate", "contact_number", "email_id",
-    "total_experience", "relevant_experience",
-    "current_ctc", "expected_ctc", "notice_period",
-    "current_org", "current_location", "preferred_location",
-    "attachment", "remarks", "record_status",
-]
-
-def _make_insert_sql():
+# ── Database helpers ───────────────────────────────────────────────────────────
+def _make_insert_sql() -> pgsql.Composed:
+    """
+    Schema-qualified INSERT — always targets DB_SCHEMA.DB_TABLE regardless
+    of the DB user's search_path. This was the root cause of the original
+    'column does not exist' error (wrong table being resolved).
+    """
     return pgsql.SQL(
-        "INSERT INTO {table} ({fields}) VALUES ({placeholders})"
+        "INSERT INTO {schema}.{table} ({fields}) VALUES ({placeholders})"
     ).format(
+        schema=pgsql.Identifier(DB_SCHEMA),
         table=pgsql.Identifier(DB_TABLE),
         fields=pgsql.SQL(", ").join(map(pgsql.Identifier, DB_COLUMNS)),
         placeholders=pgsql.SQL(", ").join(pgsql.Placeholder() * len(DB_COLUMNS)),
     )
 
+
+def _verify_table_columns(conn) -> None:
+    """
+    Pre-flight check: confirm every column in DB_COLUMNS exists in the
+    actual table. Fails fast with a clear message instead of spamming
+    per-row errors throughout the run.
+    """
+    query = """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, (DB_SCHEMA, DB_TABLE))
+        existing = {row[0] for row in cur.fetchall()}
+
+    if not existing:
+        log.error(
+            f"Table {DB_SCHEMA}.{DB_TABLE} not found or no columns returned. "
+            f"Check DB_SCHEMA / DB_TABLE_NAME env vars and DB permissions."
+        )
+        raise SystemExit(1)
+
+    missing = [c for c in DB_COLUMNS if c not in existing]
+    if missing:
+        log.error(
+            f"Columns missing from {DB_SCHEMA}.{DB_TABLE}: {missing}\n"
+            f"  Fix: add the missing columns to the table, or remove them from DB_COLUMNS."
+        )
+        raise SystemExit(1)
+
+    log.info(
+        f"Column pre-flight passed — all {len(DB_COLUMNS)} columns present "
+        f"in {DB_SCHEMA}.{DB_TABLE}."
+    )
+
+
 def insert_records_incremental(conn, records: list[dict]) -> int:
     """
-    Insert records using an already-open connection.
-    Commits after every successful row so partial progress is always saved.
-    The caller keeps the connection open across multiple calls.
+    Insert records row-by-row using an already-open connection.
+    Commits after each successful row — a failed row is rolled back
+    individually so the rest continue inserting.
     """
     insert_sql = _make_insert_sql()
     inserted = 0
@@ -647,38 +704,16 @@ def insert_records_incremental(conn, records: list[dict]) -> int:
                 f"Row insert failed for candidate "
                 f"{rec.get('name_of_candidate', '?')!r}: {exc}"
             )
-            conn.rollback()   # roll back only the failed row, keep going
+            conn.rollback()
     return inserted
 
 
-def insert_records_to_db(records: list[dict]) -> int:
-    """
-    Standalone bulk insert (kept for compatibility / one-off use).
-    Prefer insert_records_incremental inside the main loop.
-    """
-    if not records:
-        log.warning("No records to insert into DB.")
-        return 0
-
-    inserted = 0
-    try:
-        conn = psycopg2.connect(DB_DSN)
-        conn.autocommit = False
-        inserted = insert_records_incremental(conn, records)
-        conn.close()
-        log.info(f"DB: inserted {inserted}/{len(records)} row(s) into '{DB_TABLE}'.")
-    except Exception as exc:
-        log.error(f"DB connection/transaction failed: {exc}")
-
-    return inserted
-
-
-# ── Excel writer ──────────────────────────────────────────────────────────────
-HEADER_FILL  = PatternFill("solid", start_color="1F4E79")
-HEADER_FONT  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-CELL_FONT    = Font(name="Arial", size=10)
-CENTER       = Alignment(horizontal="center", vertical="center", wrap_text=True)
-LEFT         = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+# ── Excel writer ───────────────────────────────────────────────────────────────
+HEADER_FILL = PatternFill("solid", start_color="1F4E79")
+HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+CELL_FONT   = Font(name="Arial", size=10)
+CENTER      = Alignment(horizontal="center", vertical="center", wrap_text=True)
+LEFT        = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
 COL_WIDTHS = {
     "email_subject": 40, "recruiter": 18, "client_recruiter": 18,
@@ -740,7 +775,7 @@ def write_excel(records: list[dict], output_path: str) -> None:
     log.info(f"Saved {len(records)} row(s) → {output_path}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 def run() -> None:
     log.info("=== Ad-hoc extractor starting ===")
     log.info(f"Target mailbox : {TARGET_MAILBOX}")
@@ -748,14 +783,14 @@ def run() -> None:
     log.info(f"OneDrive folder: {ONEDRIVE_ARCHIVE_FOLDER}")
     log.info(f"Pulling emails from: {SINCE_DATE} onwards")
     log.info(f"Folder: {INBOX_SUBFOLDER or '(root inbox)'}")
-    log.info(f"DB table: {DB_TABLE}")
+    log.info(f"DB target: {DB_SCHEMA}.{DB_TABLE}")
     log.info(f"Skip uploads: {SKIP_UPLOADS}")
 
     mail_token = get_mail_token()
     od_token   = get_onedrive_token()
     log.info("Tokens obtained.")
 
-    # Verify OneDrive access and ensure target folder exists
+    # OneDrive check (skipped when SKIP_UPLOADS=true)
     if not SKIP_UPLOADS:
         _drive_check = requests.get(
             "https://graph.microsoft.com/v1.0/me/drive",
@@ -774,17 +809,23 @@ def run() -> None:
     else:
         log.info("Skipping OneDrive drive check (SKIP_UPLOADS=true).")
 
-    folder_id = resolve_folder_id(mail_token, INBOX_SUBFOLDER) if INBOX_SUBFOLDER else None
-    emails    = fetch_bs_emails(mail_token, folder_id)
-
-    # ── Open a single persistent DB connection for the entire run ─────────
+    # ── Open DB connection and run pre-flight column check ─────────────────
+    # _verify_table_columns exits immediately with a clear error if any
+    # column in DB_COLUMNS is missing from the real table — catching schema
+    # mismatches before any emails are processed.
     try:
         db_conn = psycopg2.connect(DB_DSN)
         db_conn.autocommit = False
         log.info("DB connection opened.")
+        _verify_table_columns(db_conn)
+    except SystemExit:
+        raise
     except Exception as exc:
         log.error(f"Cannot connect to DB: {exc} — records will NOT be inserted.")
         db_conn = None
+
+    folder_id = resolve_folder_id(mail_token, INBOX_SUBFOLDER) if INBOX_SUBFOLDER else None
+    emails    = fetch_bs_emails(mail_token, folder_id)
 
     records: list[dict] = []
     skipped  = 0
@@ -878,9 +919,9 @@ def run() -> None:
             email_records.append(record)
             log.info(f"  + {candidate_name or '(unknown)'} | {subject!r} | {row_date}")
 
-        # ── Insert this email's rows into DB immediately ───────────────────
-        # This means even if the job is cancelled mid-run, all rows
-        # processed so far are already safely committed to the database.
+        # ── Commit this email's rows immediately ───────────────────────────
+        # Progress is saved after every email. A mid-run cancellation will
+        # never lose rows that have already been processed.
         if email_records and db_conn is not None:
             n = insert_records_incremental(db_conn, email_records)
             db_count += n
@@ -898,7 +939,7 @@ def run() -> None:
             pass
 
     log.info(f"Skipped {skipped} email(s) with no recognized company code.")
-    log.info(f"Total rows collected : {len(records)}")
+    log.info(f"Total rows collected  : {len(records)}")
     log.info(f"Total DB rows inserted: {db_count}")
 
     if not records:
