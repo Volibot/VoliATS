@@ -137,7 +137,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     ],
     "current_ctc": [
         "current ctc", "current_ctc", "ctc", "current salary",
-        "current_salary", "present ctc", "present_ctc", "curr ctc",
+        "current_salary", "present ctc", "present_ctc", "curr ctc", "Rates"
     ],
     "expected_ctc": [
         "expected ctc", "expected_ctc", "expected salary", "expected_salary",
