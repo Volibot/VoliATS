@@ -460,30 +460,47 @@ def parse_subject(subject: str) -> Optional[tuple[str, str, Optional[str]]]:
 
 
 # ─── HTML table parser ─────────────────────────────────────────────────────────
+# REPLACE these two functions:
 def _strip_html(text: str) -> str:
-    # Remove style/script blocks so their content isn't treated as cell text
     text = re.sub(r"<(style|script)[^>]*>.*?</\1>", "", text, flags=re.DOTALL | re.IGNORECASE)
     return re.sub(r"<[^>]+>", "", text)
 
+# At top of file, add:
+from bs4 import BeautifulSoup
+
 def _clean_cell(text: str) -> str:
-    text = _strip_html(text)
-    text = unescape(text)                                                 # converts &nbsp; → \xa0, &amp; → &, &#160; → \xa0
-    text = re.sub(r"[\xa0\u00a0\u200b\u200c\u200d\ufeff]+", " ", text)  # replaces ALL non-breaking space variants → regular space
+    text = re.sub(r"[\xa0\u00a0\u200b\u200c\u200d\ufeff]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
-
 def parse_html_table(html: str) -> list[dict]:
+    """
+    Parse candidate rows from HTML email tables.
+
+    Uses BeautifulSoup with recursive=False to correctly handle Outlook's
+    nested-table pattern (candidate name cell wraps a mini inner table),
+    which breaks regex-based <tr>...</tr> matching.
+    """
     rows: list[dict] = []
-    for table_html in re.findall(r"<table[^>]*>(.*?)</table>", html, re.DOTALL | re.IGNORECASE):
-        all_rows = re.findall(r"<tr[^>]*>(.*?)</tr>", table_html, re.DOTALL | re.IGNORECASE)
-        if not all_rows:
+    soup = BeautifulSoup(html, "html.parser")
+
+    for table in soup.find_all("table"):
+        # Get only DIRECT child rows (not rows from nested inner tables)
+        tbody = table.find("tbody", recursive=False)
+        direct_rows = (tbody or table).find_all("tr", recursive=False)
+
+        if len(direct_rows) < 2:
             continue
-        raw_headers = re.findall(
-            r"<t[hd][^>]*>(.*?)</t[hd]>", all_rows[0], re.DOTALL | re.IGNORECASE
-        )
-        headers = [_clean_cell(h) for h in raw_headers]
+
+        # Header row — direct cells only
+        header_cells = direct_rows[0].find_all(["th", "td"], recursive=False)
+        headers = [
+            re.sub(r"\s+", " ", c.get_text(separator=" ")).strip()
+            for c in header_cells
+        ]
         if not headers:
             continue
+
+        # Map header index → canonical column name
         col_map: dict[int, str] = {}
         for idx, h in enumerate(headers):
             c = _resolve_header(h)
@@ -491,20 +508,30 @@ def parse_html_table(html: str) -> list[dict]:
                 col_map[idx] = c
             else:
                 log.debug(f"Unmapped header: {h!r}")
-        for row_html in all_rows[1:]:
-            cells = re.findall(
-                r"<t[hd][^>]*>(.*?)</t[hd]>", row_html, re.DOTALL | re.IGNORECASE
-            )
-            if not cells:
-                continue
-            cleaned = [_clean_cell(c) for c in cells]
+
+        if not col_map:
+            continue  # not a candidate table
+
+        # Data rows
+        for row in direct_rows[1:]:
+            cells = row.find_all(["th", "td"], recursive=False)
+            cleaned = [
+                _clean_cell(
+                    re.sub(r"\s+", " ", c.get_text(separator=" ")).strip()
+                )
+                for c in cells
+            ]
             if all(v == "" for v in cleaned):
                 continue
-            record = {col_map[i]: v for i, v in enumerate(cleaned) if i in col_map}
+            record = {
+                col_map[i]: v
+                for i, v in enumerate(cleaned)
+                if i in col_map
+            }
             if record:
                 rows.append(record)
-    return rows
 
+    return rows
 
 # ─── OneDrive folder & attachment upload ───────────────────────────────────────
 def _is_resume(filename: str) -> bool:
