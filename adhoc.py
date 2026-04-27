@@ -520,6 +520,22 @@ def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
 
 
 # ── Subject filter ─────────────────────────────────────────────────────────────
+
+# Subjects containing any of these words (case-insensitive) are silently
+# dropped — they are delivery-status / bounce notifications, not profiles.
+SKIP_SUBJECT_RE = re.compile(
+    r"\b(undelivered|undeliverable|delivery\s+failed|delivery\s+status"
+    r"|delivery\s+notification|mail\s+delivery|returned\s+mail"
+    r"|non[- ]?deliverable|bounced?|failed\s+delivery"
+    r"|delivered)\b",
+    re.IGNORECASE,
+)
+
+def _is_skippable_subject(subject: str) -> bool:
+    """Return True if the subject is a delivery-status notification to skip."""
+    return bool(SKIP_SUBJECT_RE.search(subject))
+
+
 SUBJECT_RE = re.compile(
     r"(?<!\S)(?:\[External\]\s*:\s*)?(?P<code>[A-Za-z]{2,4})\s*:",
     re.IGNORECASE,
@@ -577,8 +593,12 @@ def _clean_cell(text: str) -> str:
     # 4. Collapse all whitespace to a single space and strip
     return re.sub(r"\s+", " ", text).strip()
 
-# ── Value type detectors ───────────────────────────────────────────────────────
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# ── Value sanitisers ───────────────────────────────────────────────────────────
+# contact_number: keep only digits (and leading +). Strip spaces, dashes, etc.
+# email_id      : accept only values that look like a real email address.
+#                 Non-email values (phone numbers, junk) are discarded → None.
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
 _PHONE_RE = re.compile(r"^[\d\s\-\+\(\)]{7,15}$")
 
 def _looks_like_email(val: str) -> bool:
@@ -587,6 +607,64 @@ def _looks_like_email(val: str) -> bool:
 def _looks_like_phone(val: str) -> bool:
     """True if the value is all digits/spaces/dashes with no @ sign."""
     return bool(val and _PHONE_RE.match(val.strip()) and "@" not in val)
+
+def _sanitize_contact(val: Optional[str]) -> Optional[str]:
+    """
+    Keep only the numeric digits (and a leading +) from a contact number.
+    Strips spaces, dashes, dots, parentheses and any text.
+    Returns None if nothing numeric remains.
+
+    Examples:
+      '9535389410 &nbsp;'  → '9535389410'
+      '+91-98765-43210'    → '+9198765432​10'
+      'chauhanjay@g.com'   → None  (email address — reject entirely)
+      'N/A'                → None
+    """
+    if not val:
+        return None
+    v = val.strip()
+    # Reject outright if it looks like an email — prevents email→contact bleed
+    if "@" in v:
+        log.warning(f"contact_number contains email address — discarding: {v!r}")
+        return None
+    # Strip everything except digits and a leading +
+    digits = re.sub(r"[^\d+]", "", v)
+    # Remove any + that's not at the very start
+    digits = re.sub(r"(?<!^)\+", "", digits)
+    if len(digits) < 7:
+        # Too short to be a real phone number
+        log.warning(f"contact_number has too few digits after cleaning — discarding: {v!r}")
+        return None
+    return digits or None
+
+def _sanitize_email(val: Optional[str]) -> Optional[str]:
+    """
+    Accept only valid email addresses (must contain @ and a real domain).
+    Rejects plain phone numbers, junk text, and partial values.
+    Returns None if the value is not a recognisable email.
+
+    Also strips any leading/trailing non-alphanumeric junk (e.g. residual
+    &nbsp; that slipped through before HTML decoding) so that values like
+    '&nbsp;agkakde7@gmail.com' are cleaned to 'agkakde7@gmail.com'.
+
+    Examples:
+      'john@gmail.com'          → 'john@gmail.com'
+      '&nbsp;agkakde7@gmail.com'→ 'agkakde7@gmail.com'
+      '9535389410'              → None  (phone number — reject)
+      'john@'                   → None  (incomplete)
+      'not-an-email'            → None
+    """
+    if not val:
+        return None
+    import html as _html
+    # Decode any residual HTML entities, then strip non-printable/junk chars
+    v = _html.unescape(val).strip()
+    # Remove leading non-word characters before the local part (e.g. stray nbsp)
+    v = re.sub(r"^[^\w]+", "", v).strip().lower()
+    if _EMAIL_RE.match(v):
+        return v
+    log.warning(f"email_id value is not a valid email — discarding: {val!r}")
+    return None
 
 def _fix_swapped_contact_email(record: dict) -> dict:
     """
@@ -882,6 +960,13 @@ def run() -> None:
 
     for msg in emails:
         subject = msg.get("subject", "").strip()
+
+        # Skip delivery-status / bounce notifications before anything else
+        if _is_skippable_subject(subject):
+            log.info(f"Skipping delivery-status email: {subject!r}")
+            skipped += 1
+            continue
+
         parsed  = parse_subject(subject)
         if parsed is None:
             skipped += 1
@@ -926,8 +1011,9 @@ def run() -> None:
 
             effective_jr_no = _t(row.get("jr_no")) or subject_jr_no
             candidate_name  = _t(row.get("name_of_candidate"))
-            contact_number  = _t(row.get("contact_number"))
-            email_id_val    = _t(row.get("email_id"))
+            # Sanitise: contact_number → digits only; email_id → valid email only
+            contact_number  = _sanitize_contact(_t(row.get("contact_number")))
+            email_id_val    = _sanitize_email(_t(row.get("email_id")))
 
             record = {
                 "email_subject":       subject,
