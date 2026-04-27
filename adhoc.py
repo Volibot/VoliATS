@@ -90,13 +90,13 @@ DB_DSN                  = os.environ["DB_DSN"]
 
 # Schema + table always explicit — never rely on search_path
 DB_SCHEMA = os.environ.get("DB_SCHEMA", "public")
-DB_TABLE  = os.environ.get("DB_TABLE_NAME", "temp_hrvolibit_archive")
+DB_TABLE  = os.environ.get("temp_hrvolibit_archive")
 
 ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "archive")
 LIMIT                   = int(os.environ.get("LIMIT", "100"))
 
 # Set SKIP_UPLOADS=true to skip OneDrive uploads (faster catch-up runs)
-SKIP_UPLOADS = os.environ.get("SKIP_UPLOADS", "false").lower() == "true"
+SKIP_UPLOADS = os.environ.get("SKIP_UPLOADS", "false")
 
 COMPANY_CODES: dict[str, str] = {
     "BS":  "Birlasoft",
