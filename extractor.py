@@ -103,7 +103,7 @@ ONEDRIVE_USER    = os.environ["ONEDRIVE_USER"]
 DB_DSN           = os.environ["DB_DSN"]
 
 DB_SCHEMA = os.environ.get("DB_SCHEMA", "public")
-DB_TABLE  = os.environ.get("DB_TABLE_NAME", "temp_hrvolibit_archive")
+DB_TABLE  = "temp_hrvolibit_archive"
 
 ONEDRIVE_ARCHIVE_FOLDER = os.environ.get("ONEDRIVE_ARCHIVE_FOLDER", "archive")
 LIMIT        = int(os.environ.get("LIMIT", "100"))

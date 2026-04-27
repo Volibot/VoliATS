@@ -31,6 +31,7 @@ import logging
 import requests
 import psycopg2
 from psycopg2 import sql as pgsql
+from html import unescape
 from datetime import datetime, date
 from typing import Optional
 from msal import ConfidentialClientApplication, PublicClientApplication
@@ -460,11 +461,15 @@ def parse_subject(subject: str) -> Optional[tuple[str, str, Optional[str]]]:
 
 # ─── HTML table parser ─────────────────────────────────────────────────────────
 def _strip_html(text: str) -> str:
+    # Remove style/script blocks so their content isn't treated as cell text
+    text = re.sub(r"<(style|script)[^>]*>.*?</\1>", "", text, flags=re.DOTALL | re.IGNORECASE)
     return re.sub(r"<[^>]+>", "", text)
 
-
 def _clean_cell(text: str) -> str:
-    return re.sub(r"\s+", " ", _strip_html(text)).strip()
+    text = _strip_html(text)
+    text = unescape(text)                                                 # converts &nbsp; → \xa0, &amp; → &, &#160; → \xa0
+    text = re.sub(r"[\xa0\u00a0\u200b\u200c\u200d\ufeff]+", " ", text)  # replaces ALL non-breaking space variants → regular space
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def parse_html_table(html: str) -> list[dict]:
