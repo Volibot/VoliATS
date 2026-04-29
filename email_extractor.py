@@ -306,13 +306,6 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None, end
     else:
         base = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages"
 
-    # Page size capped at 50 — keeps individual responses small and avoids
-    # gateway timeouts that occur with larger pages on busy mailboxes.
-    # $expand=attachments is intentionally omitted — see docstring above.
-    #
-    # Date filter: Graph API uses ISO-8601 datetimes in UTC.
-    # We filter receivedDateTime between end_date 00:00:00 UTC and today
-    # 23:59:59 UTC so the full date range is included.
     _today_iso    = datetime.utcnow().strftime("%Y-%m-%dT23:59:59Z")
     _end_date_iso = (
         f"{end_date.strftime('%Y-%m-%d')}T00:00:00Z"
@@ -452,7 +445,6 @@ def parse_subject(subject: str) -> Optional[tuple[str, str, Optional[str]]]:
         log.debug(f"Skip — no pattern match: {subject!r}")
         return None
 
-    # Use the raw code as-is — no lookup table
     company_name = m.group("code").upper()
     jr_no, skill = _extract_jr_and_skill(m.group("rest"))
     log.debug(f"Parsed subject → company={company_name!r} skill={skill!r} jr_no={jr_no!r}")
@@ -460,17 +452,13 @@ def parse_subject(subject: str) -> Optional[tuple[str, str, Optional[str]]]:
 
 
 # ─── HTML table parser ─────────────────────────────────────────────────────────
-# REPLACE these two functions:
-def _strip_html(text: str) -> str:
-    text = re.sub(r"<(style|script)[^>]*>.*?</\1>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    return re.sub(r"<[^>]+>", "", text)
-
-# At top of file, add:
 from bs4 import BeautifulSoup
+
 
 def _clean_cell(text: str) -> str:
     text = re.sub(r"[\xa0\u00a0\u200b\u200c\u200d\ufeff]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
 
 def parse_html_table(html: str) -> list[dict]:
     """
@@ -484,14 +472,12 @@ def parse_html_table(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
 
     for table in soup.find_all("table"):
-        # Get only DIRECT child rows (not rows from nested inner tables)
         tbody = table.find("tbody", recursive=False)
         direct_rows = (tbody or table).find_all("tr", recursive=False)
 
         if len(direct_rows) < 2:
             continue
 
-        # Header row — direct cells only
         header_cells = direct_rows[0].find_all(["th", "td"], recursive=False)
         headers = [
             re.sub(r"\s+", " ", c.get_text(separator=" ")).strip()
@@ -500,7 +486,6 @@ def parse_html_table(html: str) -> list[dict]:
         if not headers:
             continue
 
-        # Map header index → canonical column name
         col_map: dict[int, str] = {}
         for idx, h in enumerate(headers):
             c = _resolve_header(h)
@@ -510,9 +495,8 @@ def parse_html_table(html: str) -> list[dict]:
                 log.debug(f"Unmapped header: {h!r}")
 
         if not col_map:
-            continue  # not a candidate table
+            continue
 
-        # Data rows
         for row in direct_rows[1:]:
             cells = row.find_all(["th", "td"], recursive=False)
             cleaned = [
@@ -532,6 +516,134 @@ def parse_html_table(html: str) -> list[dict]:
                 rows.append(record)
 
     return rows
+
+
+# ─── Resume-to-candidate name matching ─────────────────────────────────────────
+
+def _name_tokens(name: str) -> set[str]:
+    """
+    Tokenise a name or filename stem into lowercase words, stripping punctuation
+    and digits so that "John_Smith_2024.pdf" → {"john", "smith"}.
+    """
+    # Remove extension if present
+    stem = os.path.splitext(name)[0]
+    # Replace separators with spaces
+    stem = re.sub(r"[_\-\.]+", " ", stem)
+    # Strip digits (version numbers, years, phone suffixes, etc.)
+    stem = re.sub(r"\d+", " ", stem)
+    tokens = {t.lower() for t in stem.split() if len(t) > 1}
+    return tokens
+
+
+def _match_score(candidate_name: str, filename: str) -> int:
+    """
+    Return the number of word tokens shared between the candidate's name and
+    the attachment filename stem.  Higher = better match.
+    """
+    if not candidate_name or not filename:
+        return 0
+    name_tok = _name_tokens(candidate_name)
+    file_tok = _name_tokens(filename)
+    return len(name_tok & file_tok)
+
+
+def _substring_match_score(candidate_name: str, filename: str) -> int:
+    """
+    Fallback scorer for filenames where the recruiter merged name words without
+    spaces (e.g. candidate "Bhandhavya K" → file "BhandhavyaK 6y.pdf").
+
+    Strategy: strip the file stem of digits/separators, then check whether
+    any name token of length >= 4 appears inside it as a case-insensitive
+    substring.  Returns the count of such hits so the caller can still rank.
+    """
+    stem = re.sub(r"[_\-\.]+", "", os.path.splitext(filename)[0])
+    stem = re.sub(r"\d+", "", stem).lower()
+    hits = 0
+    for token in _name_tokens(candidate_name):
+        if len(token) >= 4 and token in stem:
+            hits += 1
+    return hits
+
+
+def match_resume_for_candidate(
+    candidate_name: Optional[str],
+    attachment_map: dict[str, str],
+    claimed: set[str],
+) -> str:
+    """
+    Given a dict of {filename: url} for all attachments in the email, find the
+    best-matching resume for *candidate_name* that has not already been claimed
+    by a previous candidate row.
+
+    Matching is done in two passes so that clear word-token matches always beat
+    fuzzy substring matches:
+
+    Pass 1 — Token overlap (primary)
+        Tokenise both the candidate name and the filename stem into lowercase
+        words (stripping digits and punctuation).  Score = number of shared
+        tokens.  A score >= 1 is a match.
+
+        Handles the common cases:
+          "Pratik Sawarkar"  ↔  "Pratik Sawarkar.pdf"        (score 2)
+          "Pandu Ranga"      ↔  "Pandu Ranga 5.4y.pdf"       (score 2)
+          "PRABAKARAN N"     ↔  "PRABAKARAN N.pdf"            (score 2)
+
+    Pass 2 — Substring fallback (for merged-word filenames)
+        If no file scores >= 1 in Pass 1, check whether any name token of
+        length >= 4 appears as a substring inside the filename stem (digits and
+        separators stripped).  Score = number of such hits.
+
+        Handles the edge case:
+          "Bhandhavya K"  ↔  "BhandhavyaK 6y.pdf"
+          → tokens {"bhandhavya","k"}, stem "bhandhavyak" (after strip)
+          → "bhandhavya" found inside stem → score 1
+
+    If neither pass finds a match the attachment is left blank for that
+    candidate (per spec).  The matched filename is added to *claimed* so it
+    won't be reused by a later candidate in the same email.
+    """
+    if not attachment_map:
+        return ""
+
+    name = candidate_name or ""
+
+    # ── Pass 1: token overlap ─────────────────────────────────────────────────
+    best_filename: Optional[str] = None
+    best_score = 0
+
+    for filename in attachment_map:
+        if filename in claimed:
+            continue
+        score = _match_score(name, filename)
+        if score > best_score:
+            best_score = score
+            best_filename = filename
+
+    if best_filename is not None and best_score >= 1:
+        claimed.add(best_filename)
+        log.info(f"  📎 [token] Matched {name!r} → {best_filename!r} (score={best_score})")
+        return attachment_map[best_filename]
+
+    # ── Pass 2: substring fallback ────────────────────────────────────────────
+    best_filename = None
+    best_score = 0
+
+    for filename in attachment_map:
+        if filename in claimed:
+            continue
+        score = _substring_match_score(name, filename)
+        if score > best_score:
+            best_score = score
+            best_filename = filename
+
+    if best_filename is not None and best_score >= 1:
+        claimed.add(best_filename)
+        log.info(f"  📎 [substr] Matched {name!r} → {best_filename!r} (score={best_score})")
+        return attachment_map[best_filename]
+
+    log.debug(f"  ↷ No resume match for {name!r} — leaving blank")
+    return ""
+
 
 # ─── OneDrive folder & attachment upload ───────────────────────────────────────
 def _is_resume(filename: str) -> bool:
@@ -638,16 +750,17 @@ def _upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optiona
     return None
 
 
-def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
+def upload_all_attachments(od_token: str, mail_token: str, msg: dict) -> dict[str, str]:
     """
-    Fetch resume attachments on demand and upload them to OneDrive.
+    Upload ALL resume attachments for a message to OneDrive and return a
+    mapping of {original_filename: onedrive_url_or_filename}.
 
-    Attachments are NOT expanded inline during the email list fetch (which
-    would balloon response sizes). Instead they are fetched here per message
-    using the /attachments endpoint, only when hasAttachments is True.
+    Previously this returned a single comma-joined string shared across every
+    candidate row.  Now it returns a per-file dict so each candidate row can be
+    matched to its own resume via match_resume_for_candidate().
     """
     if not msg.get("hasAttachments"):
-        return ""
+        return {}
 
     url = (
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
@@ -663,9 +776,9 @@ def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
         attachments = resp.json().get("value", [])
     except Exception as exc:
         log.warning(f"Could not fetch attachment list for {msg['id']}: {exc}")
-        return ""
+        return {}
 
-    links: list[str] = []
+    result: dict[str, str] = {}
     for att in attachments:
         filename = att.get("name", "")
         if not filename or not _is_resume(filename):
@@ -673,17 +786,18 @@ def upload_attachments(od_token: str, mail_token: str, msg: dict) -> str:
             continue
         att_id = att.get("id", "")
         if not att_id:
-            links.append(filename)
+            result[filename] = filename
             continue
         try:
             content = _fetch_attachment_content(mail_token, msg["id"], att_id)
             link    = _upload_to_onedrive(od_token, filename, content)
-            links.append(link if link else filename)
+            result[filename] = link if link else filename
         except Exception as exc:
             log.error(f"Failed to upload {filename!r}: {exc}")
-            links.append(filename)
+            result[filename] = filename
 
-    return ", ".join(links)
+    log.info(f"  Uploaded {len(result)} resume(s): {list(result.keys())}")
+    return result
 
 
 # ─── DB schema helpers ──────────────────────────────────────────────────────────
@@ -1109,8 +1223,6 @@ def process_emails() -> None:
             mark_email_read(token, msg["id"])
             continue
 
-        # parse_subject returns (company_name, general_skill, jr_no)
-        # company_name is the raw subject code — no lookup table applied
         company_name, general_skill, subject_jr_no = parsed
 
         from_addr = _extract_address(msg.get("from", {}))
@@ -1121,7 +1233,11 @@ def process_emails() -> None:
         client_recruiter = _username_from_email(to_addr)
         delivery_type    = _delivery_type(from_addr, to_addr)
 
-        attachment_str = upload_attachments(od_token, token, msg)
+        # ── Upload all resumes once; match individually per candidate row ──────
+        # attachment_map: {filename: onedrive_url_or_filename}
+        # claimed:        filenames already assigned to a previous row in this email
+        attachment_map: dict[str, str] = upload_all_attachments(od_token, token, msg)
+        claimed: set[str] = set()
 
         body_html = (msg.get("body") or {}).get("content", "")
         rows      = parse_html_table(body_html)
@@ -1160,6 +1276,11 @@ def process_emails() -> None:
             effective_jr_no = _t(row.get("jr_no")) or subject_jr_no
             candidate_name  = _t(row.get("name_of_candidate"))
 
+            # ── Match this candidate's resume from the shared attachment map ───
+            candidate_attachment = match_resume_for_candidate(
+                candidate_name, attachment_map, claimed
+            )
+
             # ── TIER 1: Same recruiter — auto-update empty fields ─────────────
             same_key = find_same_key_record(
                 cur, row_date,
@@ -1183,7 +1304,7 @@ def process_emails() -> None:
                     "current_org":         _t(row.get("current_org")),
                     "current_location":    _t(row.get("current_location")),
                     "preferred_location":  _t(row.get("preferred_location")),
-                    "attachment":          _t(attachment_str),
+                    "attachment":          _t(candidate_attachment) or None,
                     "remarks":             _t(row.get("remarks")),
                 })
                 if record_updates:
@@ -1248,7 +1369,7 @@ def process_emails() -> None:
                     "email_to":            _t(to_addr),
                     "delivery_type":       delivery_type,
                     "company_name":        company_name,
-                    "attachment":          _t(attachment_str),
+                    "attachment":          _t(candidate_attachment) or None,
                     "is_duplicate":        "Duplicate Recruiter",
                     "created_by":          _t(from_addr),
                     "created_date":        now,
@@ -1338,7 +1459,7 @@ def process_emails() -> None:
                 "email_to":            _t(to_addr),
                 "delivery_type":       delivery_type,
                 "company_name":        company_name,
-                "attachment":          _t(attachment_str),
+                "attachment":          _t(candidate_attachment) or None,
                 "is_duplicate":        _t(dup_flag),
                 "created_by":          _t(from_addr),
                 "created_date":        now,
@@ -1364,7 +1485,8 @@ def process_emails() -> None:
                 email_inserted += 1
                 log.info(
                     f"  ✓ {candidate_name or '(unknown)'} | "
-                    f"recruiter={recruiter} | dup={dup_flag or 'none'}"
+                    f"recruiter={recruiter} | dup={dup_flag or 'none'} | "
+                    f"attachment={'yes' if candidate_attachment else 'none'}"
                 )
                 if contact_dup is not None:
                     send_diff_recruiter_notification_email(
