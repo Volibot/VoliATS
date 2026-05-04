@@ -164,6 +164,15 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "remarks": [
         "remarks", "comments", "comment", "note", "notes",
     ],
+    "general_skill": [
+        "skill", "skills", "general skill", "general_skill",
+        "technology", "technologies", "tech", "tech stack",
+        "skill set", "skillset", "skill_set", "primary skill",
+        "primary_skill", "key skill", "key_skill", "key skills",
+        "expertise", "specialization", "specialisation",
+        "domain", "profile", "role", "designation",
+        "position", "job title", "job_title", "title",
+    ],
 }
 
 
@@ -1223,7 +1232,7 @@ def process_emails() -> None:
             mark_email_read(token, msg["id"])
             continue
 
-        company_name, general_skill, subject_jr_no = parsed
+        company_name, subject_skill, subject_jr_no = parsed
 
         from_addr = _extract_address(msg.get("from", {}))
         to_list   = msg.get("toRecipients", [])
@@ -1275,6 +1284,15 @@ def process_emails() -> None:
             email_id_val    = _t(row.get("email_id"))
             effective_jr_no = _t(row.get("jr_no")) or subject_jr_no
             candidate_name  = _t(row.get("name_of_candidate"))
+
+            # ── Skill: prefer table value, fall back to subject ────────────────
+            row_skill = _t(row.get("general_skill"))
+            general_skill = row_skill if row_skill else subject_skill
+            if row_skill:
+                log.debug(
+                    f"  Skill from table: {row_skill!r} "
+                    f"(subject had: {subject_skill!r})"
+                )
 
             # ── Match this candidate's resume from the shared attachment map ───
             candidate_attachment = match_resume_for_candidate(
