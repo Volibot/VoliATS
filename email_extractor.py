@@ -1285,6 +1285,12 @@ def process_emails() -> None:
             effective_jr_no = _t(row.get("jr_no")) or subject_jr_no
             candidate_name  = _t(row.get("name_of_candidate"))
 
+            if not candidate_name and not contact_number and not email_id_val:
+                log.info("  ↷ Skipping row with no candidate identifiers (likely a job requirements row)")
+                email_skipped_rows += 1
+                skipped += 1
+                continue
+
             # ── Skill: prefer table value, fall back to subject ────────────────
             row_skill = _t(row.get("general_skill"))
             general_skill = row_skill if row_skill else subject_skill
