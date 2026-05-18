@@ -38,6 +38,7 @@ from msal import ConfidentialClientApplication, PublicClientApplication
 from notifier import (
     send_notification_email,
     send_diff_recruiter_notification_email,
+    send_multi_client_notification_email,
 )
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -91,7 +92,12 @@ except ValueError:
     )
 
 # Fields that may be auto-filled when NULL/empty in an existing record.
+# Identity fields (name/contact/email) come first so a previously-incomplete
+# record can become Pass once the missing identifiers arrive in a new submission.
 UPDATABLE_FIELDS = [
+    "name_of_candidate",
+    "contact_number",
+    "email_id",
     "jr_no",
     "total_experience", "relevant_experience",
     "current_ctc", "expected_ctc",
@@ -881,8 +887,11 @@ def find_same_key_record(
         SELECT {cols} FROM {table}
         WHERE date = %s
           AND date >= CURRENT_DATE - (INTERVAL '1 month' * %s)
-          AND LOWER(COALESCE(contact_number,   '')) = LOWER(COALESCE(%s, ''))
-          AND LOWER(COALESCE(email_id,         '')) = LOWER(COALESCE(%s, ''))
+          AND (
+            (LOWER(COALESCE(contact_number, '')) = LOWER(%s) AND %s <> '')
+            OR
+            (LOWER(COALESCE(email_id,       '')) = LOWER(%s) AND %s <> '')
+          )
           AND (LOWER(COALESCE(jr_no,           '')) = LOWER(COALESCE(%s, ''))
                OR LOWER(COALESCE(general_skill,'')) = LOWER(COALESCE(%s, '')))
           AND LOWER(COALESCE(client_recruiter, '')) = LOWER(COALESCE(%s, ''))
@@ -895,9 +904,54 @@ def find_same_key_record(
     )
     cur.execute(query, (
         row_date, DUPLICATE_CHECK_MONTHS,
-        contact_number, email_id,
+        contact_number, contact_number,
+        email_id,       email_id,
         jr_no, general_skill,
         client_recruiter, recruiter, delivery_type,
+    ))
+    row = cur.fetchone()
+    return dict(zip(cols, row)) if row else None
+
+
+def find_same_recruiter_record(
+    cur,
+    contact_number: str,
+    email_id: str,
+    recruiter: str,
+) -> Optional[dict]:
+    """
+    Find any existing record for this candidate submitted by the same internal
+    recruiter, regardless of client or job.  Used as TIER 1.5 to detect when
+    the same recruiter shares the same candidate to a different client or for a
+    different job.
+    """
+    if not contact_number and not email_id:
+        return None
+
+    cols = list(dict.fromkeys([
+        "id", "recruiter", "client_recruiter", "name_of_candidate",
+        "email_from", "jr_no", "general_skill", "company_name", "date",
+    ] + UPDATABLE_FIELDS))
+    query = pgsql.SQL("""
+        SELECT {cols} FROM {table}
+        WHERE date >= CURRENT_DATE - (INTERVAL '1 month' * %s)
+          AND (
+            (LOWER(COALESCE(contact_number, '')) = LOWER(%s) AND %s <> '')
+            OR
+            (LOWER(COALESCE(email_id,       '')) = LOWER(%s) AND %s <> '')
+          )
+          AND LOWER(COALESCE(recruiter, '')) = LOWER(COALESCE(%s, ''))
+        ORDER BY date DESC
+        LIMIT 1
+    """).format(
+        cols=pgsql.SQL(", ").join(pgsql.Identifier(c) for c in cols),
+        table=pgsql.Identifier(DB_TABLE),
+    )
+    cur.execute(query, (
+        DUPLICATE_CHECK_MONTHS,
+        contact_number, contact_number,
+        email_id,       email_id,
+        recruiter,
     ))
     row = cur.fetchone()
     return dict(zip(cols, row)) if row else None
@@ -911,12 +965,11 @@ def find_different_recruiter_record(
     jr_no: str,
     general_skill: str,
     recruiter: str,
-    client_recruiter: str,
 ) -> Optional[dict]:
     if not contact_number and not email_id:
         return None
 
-    cols  = ["id", "recruiter", "client_recruiter", "name_of_candidate", "email_from"] + UPDATABLE_FIELDS
+    cols  = list(dict.fromkeys(["id", "recruiter", "client_recruiter", "name_of_candidate", "email_from", "date"] + UPDATABLE_FIELDS))
     query = pgsql.SQL("""
         SELECT {cols} FROM {table}
         WHERE date >= CURRENT_DATE - (INTERVAL '1 month' * %s)
@@ -924,8 +977,7 @@ def find_different_recruiter_record(
           AND LOWER(COALESCE(email_id,         '')) = LOWER(COALESCE(%s, ''))
           AND (LOWER(COALESCE(jr_no,           '')) = LOWER(COALESCE(%s, ''))
                OR LOWER(COALESCE(general_skill,'')) = LOWER(COALESCE(%s, '')))
-          AND (LOWER(COALESCE(recruiter,        '')) != LOWER(COALESCE(%s, ''))
-               OR LOWER(COALESCE(client_recruiter,'')) != LOWER(COALESCE(%s, '')))
+          AND LOWER(COALESCE(recruiter, '')) != LOWER(COALESCE(%s, ''))
         LIMIT 1
     """).format(
         cols=pgsql.SQL(", ").join(pgsql.Identifier(c) for c in cols),
@@ -935,7 +987,7 @@ def find_different_recruiter_record(
         DUPLICATE_CHECK_MONTHS,
         contact_number, email_id,
         jr_no, general_skill,
-        recruiter, client_recruiter,
+        recruiter,
     ))
     row = cur.fetchone()
     return dict(zip(cols, row)) if row else None
@@ -1000,30 +1052,48 @@ def apply_field_updates(cur, record_id: int, updates: dict) -> None:
 
 
 # ─── Standard duplicate flag ───────────────────────────────────────────────────
-def check_duplicate(cur, contact_number: str, email_id: str) -> str:
+def check_duplicate(
+    cur,
+    contact_number: str,
+    email_id: str,
+    jr_no: str = "",
+    general_skill: str = "",
+) -> str:
     if not contact_number and not email_id:
         return ""
 
     tbl = pgsql.Identifier(DB_TABLE)
 
+    # Both phone and email must match the same JR/skill to be a true duplicate.
+    # Without a JR/skill constraint the same candidate could appear across
+    # different open positions without being a real duplicate submission.
+    jr_clause = pgsql.SQL(
+        " AND (LOWER(COALESCE(jr_no,''))=LOWER(%s) OR LOWER(COALESCE(general_skill,''))=LOWER(%s))"
+    )
+
     cell_dup = email_dup = False
     if contact_number:
-        cur.execute(
-            pgsql.SQL(
-                "SELECT 1 FROM {t} WHERE contact_number = %s"
-                " AND date >= CURRENT_DATE - (INTERVAL '1 month' * %s) LIMIT 1"
-            ).format(t=tbl),
-            (contact_number, DUPLICATE_CHECK_MONTHS),
-        )
+        q = pgsql.SQL(
+            "SELECT 1 FROM {t} WHERE contact_number = %s"
+            " AND date >= CURRENT_DATE - (INTERVAL '1 month' * %s)"
+        ).format(t=tbl)
+        params = [contact_number, DUPLICATE_CHECK_MONTHS]
+        if jr_no or general_skill:
+            q = q + jr_clause
+            params += [jr_no, general_skill]
+        cur.execute(q + pgsql.SQL(" LIMIT 1"), params)
         cell_dup = bool(cur.fetchone())
+
     if email_id:
-        cur.execute(
-            pgsql.SQL(
-                "SELECT 1 FROM {t} WHERE email_id = %s"
-                " AND date >= CURRENT_DATE - (INTERVAL '1 month' * %s) LIMIT 1"
-            ).format(t=tbl),
-            (email_id, DUPLICATE_CHECK_MONTHS),
-        )
+        q = pgsql.SQL(
+            "SELECT 1 FROM {t} WHERE email_id = %s"
+            " AND date >= CURRENT_DATE - (INTERVAL '1 month' * %s)"
+        ).format(t=tbl)
+        params = [email_id, DUPLICATE_CHECK_MONTHS]
+        if jr_no or general_skill:
+            q = q + jr_clause
+            params += [jr_no, general_skill]
+        cur.execute(q + pgsql.SQL(" LIMIT 1"), params)
         email_dup = bool(cur.fetchone())
 
     if cell_dup and email_dup:
@@ -1319,6 +1389,9 @@ def process_emails() -> None:
 
             if same_key is not None:
                 record_updates = compute_updates(same_key, {
+                    "name_of_candidate":   candidate_name,
+                    "contact_number":      contact_number,
+                    "email_id":            email_id_val,
                     "jr_no":               effective_jr_no,
                     "total_experience":    _t(row.get("total_experience")),
                     "relevant_experience": _t(row.get("relevant_experience")),
@@ -1333,6 +1406,25 @@ def process_emails() -> None:
                 })
                 if record_updates:
                     apply_field_updates(cur, same_key["id"], record_updates)
+                    # If any identity field was filled, recompute record_status
+                    # so a previously-Fail record can become Pass.
+                    identity_filled = record_updates.keys() & {"name_of_candidate", "contact_number", "email_id"}
+                    if identity_filled:
+                        eff_name    = record_updates.get("name_of_candidate")    or same_key.get("name_of_candidate")    or candidate_name
+                        eff_contact = record_updates.get("contact_number")       or same_key.get("contact_number")       or contact_number
+                        eff_email   = record_updates.get("email_id")             or same_key.get("email_id")             or email_id_val
+                        new_status  = _record_status({
+                            "name_of_candidate": eff_name,
+                            "contact_number":    eff_contact,
+                            "email_id":          eff_email,
+                            "general_skill":     general_skill,
+                            "company_name":      company_name,
+                            "recruiter":         recruiter,
+                            "email_from":        from_addr,
+                            "email_to":          to_addr,
+                        })
+                        apply_field_updates(cur, same_key["id"], {"record_status": new_status})
+                        log.info(f"  ↑ record_status → {new_status!r} for record {same_key['id']}")
                     outcome = "updated"
                     email_updated += 1
                     updated += 1
@@ -1360,6 +1452,118 @@ def process_emails() -> None:
                 })
                 continue
 
+            # ── TIER 1.5: Same recruiter, same candidate, different client/job ──
+            same_rec = find_same_recruiter_record(
+                cur,
+                contact_number or "",
+                email_id_val   or "",
+                recruiter      or "",
+            )
+
+            if same_rec is not None:
+                ex_jr     = (same_rec.get("jr_no")           or "").strip().lower()
+                ex_skill  = (same_rec.get("general_skill")   or "").strip().lower()
+                ex_client = (same_rec.get("client_recruiter") or "").strip().lower()
+                new_jr    = (effective_jr_no or "").strip().lower()
+                new_skill = (general_skill   or "").strip().lower()
+                new_client = (client_recruiter or "").strip().lower()
+
+                same_job    = bool(
+                    (ex_jr    and new_jr    and ex_jr    == new_jr) or
+                    (ex_skill and new_skill and ex_skill == new_skill)
+                )
+                same_client = (ex_client == new_client)
+
+                if not same_client or not same_job:
+                    dup_label = (
+                        "Multi-Client" if same_job and not same_client else
+                        "Multi-Job"    if not same_job and same_client  else
+                        "Multi-Client-Job"
+                    )
+                    mc_record_data = {
+                        "recruiter":           _t(recruiter),
+                        "date":                row_date,
+                        "jr_no":               effective_jr_no,
+                        "client_recruiter":    _t(client_recruiter),
+                        "general_skill":       _t(general_skill),
+                        "name_of_candidate":   candidate_name,
+                        "contact_number":      contact_number,
+                        "email_id":            email_id_val,
+                        "total_experience":    _t(row.get("total_experience")),
+                        "relevant_experience": _t(row.get("relevant_experience")),
+                        "current_ctc":         _t(row.get("current_ctc")),
+                        "expected_ctc":        _t(row.get("expected_ctc")),
+                        "notice_period":       _t(row.get("notice_period")),
+                        "current_org":         _t(row.get("current_org")),
+                        "current_location":    _t(row.get("current_location")),
+                        "preferred_location":  _t(row.get("preferred_location")),
+                        "email_from":          _t(from_addr),
+                        "email_to":            _t(to_addr),
+                        "delivery_type":       delivery_type,
+                        "company_name":        company_name,
+                        "attachment":          _t(candidate_attachment) or None,
+                        "is_duplicate":        dup_label,
+                        "created_by":          _t(from_addr),
+                        "created_date":        now,
+                        "modified_by":         _t(from_addr),
+                        "modified_date":       now,
+                        "remarks":             _t(row.get("remarks")),
+                        "record_status":       _record_status({
+                            "name_of_candidate": candidate_name,
+                            "contact_number":    contact_number,
+                            "email_id":          email_id_val,
+                            "general_skill":     _t(general_skill),
+                            "company_name":      company_name,
+                            "recruiter":         _t(recruiter),
+                            "email_from":        _t(from_addr),
+                            "email_to":          _t(to_addr),
+                        }),
+                        "status": "Screen Pending",
+                    }
+
+                    ok = insert_record(cur, mc_record_data)
+                    if ok:
+                        inserted += 1
+                        email_inserted += 1
+                        log.info(
+                            f"  ✓ [{dup_label}] Inserted {candidate_name or '(unknown)'} "
+                            f"recruiter={recruiter} | new_client={client_recruiter} "
+                            f"| prev_client={same_rec.get('client_recruiter')} "
+                            f"| same_job={same_job}"
+                        )
+                    else:
+                        errors += 1
+                        email_errors += 1
+                        log.error(f"  ✗ [{dup_label}] Insert failed for {candidate_name}")
+
+                    send_multi_client_notification_email(
+                        token=token,
+                        recruiter_addr=from_addr,
+                        existing_row={
+                            **same_rec,
+                            "company_name": company_name,
+                        },
+                        new_record_data=mc_record_data,
+                        original_subject=subject,
+                        same_job=same_job,
+                        same_client=same_client,
+                        inserted_ok=ok,
+                    )
+
+                    rows_summary.append({
+                        "name":            candidate_name or "(unknown)",
+                        "outcome":         "inserted" if ok else "error",
+                        "record_data":     mc_record_data,
+                        "updated_fields":  [],
+                        "missing":         [f for f in _REQUIRED_FIELDS if not mc_record_data.get(f)],
+                        "dup_flag":        dup_label,
+                        "db_error":        None if ok else "DB insert failed — check extractor.log",
+                        "existing_record": {**same_rec, "company_name": company_name},
+                        "same_job":        same_job,
+                        "same_client":     same_client,
+                    })
+                    continue
+
             # ── TIER 2: Different recruiter — insert immediately, notify ───────
             diff_key = find_different_recruiter_record(
                 cur, row_date,
@@ -1368,7 +1572,6 @@ def process_emails() -> None:
                 effective_jr_no or "",
                 general_skill   or "",
                 recruiter       or "",
-                client_recruiter or "",
             )
 
             if diff_key is not None:
@@ -1441,14 +1644,19 @@ def process_emails() -> None:
                 )
 
                 rows_summary.append({
-                    "name":           candidate_name or "(unknown)",
-                    "outcome":        "inserted" if ok else "error",
-                    "record_data":    new_record_data,
-                    "updated_fields": [],
-                    "missing":        [f for f in _REQUIRED_FIELDS if not new_record_data.get(f)],
-                    "dup_flag":       "Duplicate Recruiter",
-                    "db_error":       None if ok else "DB insert failed — check extractor.log",
-                    "diff_recruiter": diff_key.get("recruiter"),
+                    "name":            candidate_name or "(unknown)",
+                    "outcome":         "inserted" if ok else "error",
+                    "record_data":     new_record_data,
+                    "updated_fields":  [],
+                    "missing":         [f for f in _REQUIRED_FIELDS if not new_record_data.get(f)],
+                    "dup_flag":        "Duplicate Recruiter",
+                    "db_error":        None if ok else "DB insert failed — check extractor.log",
+                    "diff_recruiter":  diff_key.get("recruiter"),
+                    "existing_record": {
+                        **diff_key,
+                        "general_skill": general_skill,
+                        "company_name":  company_name,
+                    },
                 })
                 continue
 
@@ -1460,7 +1668,13 @@ def process_emails() -> None:
             )
 
             # ── TIER 3: No matching record — standard insert path ──────────────
-            dup_flag = check_duplicate(cur, contact_number or "", email_id_val or "")
+            dup_flag = check_duplicate(
+                cur,
+                contact_number  or "",
+                email_id_val    or "",
+                effective_jr_no or "",
+                general_skill   or "",
+            )
 
             record_data = {
                 "recruiter":           _t(recruiter),

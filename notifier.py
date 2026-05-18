@@ -26,8 +26,9 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-TARGET_MAILBOX   = os.environ["TARGET_MAILBOX"]
-NOTIFY_CC_EMAILS = os.environ.get("NOTIFY_CC_EMAILS", "")
+TARGET_MAILBOX         = os.environ["TARGET_MAILBOX"]
+NOTIFY_CC_EMAILS       = os.environ.get("NOTIFY_CC_EMAILS", "")
+DUPLICATE_CHECK_MONTHS = int(os.environ.get("DUPLICATE_CHECK_MONTHS", "3"))
 # Manager emails CC'd specifically on recruiter-level duplicate notifications
 DIFF_RECRUITER_MANAGER_EMAILS = os.environ.get("DIFF_RECRUITER_MANAGER_EMAILS", "")
 
@@ -231,6 +232,8 @@ def _candidate_card_html(row_summary: dict) -> str:
     name            = _val(rd.get("name_of_candidate")) or row_summary.get("name", "(unknown)")
     dup             = _val(row_summary.get("dup_flag"))
     db_err          = row_summary.get("db_error")
+    diff_recruiter  = _val(row_summary.get("diff_recruiter"))
+    existing_record = row_summary.get("existing_record") or {}
 
     # ── Card style per outcome ───────────────────────────────────────────────
     if outcome == "skipped":
@@ -243,8 +246,10 @@ def _candidate_card_html(row_summary: dict) -> str:
         card_cls, badge_cls, badge_txt = "conflict", "conflict", "Conflict — Pending Review"
     elif outcome == "error":
         card_cls, badge_cls, badge_txt = "fail", "fail", "Error"
-    elif dup in ("Duplicate Recruiter",) and outcome == "inserted":
+    elif dup == "Duplicate Recruiter" and outcome == "inserted":
         card_cls, badge_cls, badge_txt = "dup-recruiter", "dup-recruiter", "Inserted — Duplicate Recruiter"
+    elif dup in ("Multi-Client", "Multi-Job", "Multi-Client-Job") and outcome == "inserted":
+        card_cls, badge_cls, badge_txt = "dup-contact", "dup-contact", f"Inserted — {dup.replace('-', ' ')}"
     elif dup in ("Duplicate Contact",) and outcome == "inserted":
         card_cls, badge_cls, badge_txt = "dup-contact", "dup-contact", "Inserted — Duplicate Contact"
     elif missing:
@@ -340,21 +345,110 @@ def _candidate_card_html(row_summary: dict) -> str:
                 f'</tr>'
             )
 
-    if dup:
+    if dup == "Duplicate Recruiter" and outcome == "inserted":
+        # ── FYI block showing original submitter + field comparison ──────────
+        orig          = diff_recruiter or existing_record.get("recruiter") or "another recruiter"
+        orig_date     = _val(existing_record.get("date")) or "—"
+        new_recruiter_display = _val(rd.get("recruiter")) or "this recruiter"
+        jr_or_skill   = _val(rd.get("jr_no")) or _val(rd.get("general_skill")) or "—"
+        date_display  = _val(rd.get("date")) or "—"
+
+        html += (
+            f'</table>'  # close the field table opened above
+            f'<div style="margin:12px 0;padding:14px 16px;background:#e8f0fe;'
+            f'border-left:4px solid #1a73e8;border-radius:4px;font-size:13px;color:#1a237e">'
+            f'<strong>FYI — no action required.</strong><br>'
+            f'The candidate <strong>{name}</strong> was submitted for '
+            f'<strong>{jr_or_skill}</strong> on <strong>{date_display}</strong> '
+            f'by recruiter <strong>{new_recruiter_display}</strong>.<br>'
+            f'An earlier record for the same candidate already exists, first submitted on '
+            f'<strong>{orig_date}</strong> by <strong>{orig}</strong>.'
+            f'<br><br>The record has been added to the database.'
+            f'</div>'
+        )
+
+        if existing_record:
+            html += (
+                f'<p style="font-size:12px;color:#555;margin:8px 0 4px">'
+                f'Highlighted rows have different values between the two submissions.</p>'
+                f'{_comparison_table_html(existing_record, rd)}'
+            )
+
+        html += '</div></div>'
+        return html
+
+    elif dup in ("Multi-Client", "Multi-Job", "Multi-Client-Job") and outcome == "inserted":
+        same_job    = row_summary.get("same_job",    True)
+        same_client = row_summary.get("same_client", True)
+        prev_client = _val(existing_record.get("client_recruiter")) or "—"
+        new_client  = _val(rd.get("client_recruiter")) or "—"
+        prev_jr     = _val(existing_record.get("jr_no")) or _val(existing_record.get("general_skill")) or "—"
+        new_jr      = _val(rd.get("jr_no")) or _val(rd.get("general_skill")) or "—"
+
+        if same_job and not same_client:
+            fyi_msg = (
+                f'The same candidate was previously submitted for the <strong>same job</strong> '
+                f'(<strong>{new_jr}</strong>) to client <strong>{prev_client}</strong>. '
+                f'Now being submitted to client <strong>{new_client}</strong>.'
+            )
+        elif not same_job and same_client:
+            fyi_msg = (
+                f'The same candidate was previously submitted to the <strong>same client</strong> '
+                f'(<strong>{new_client}</strong>) for job <strong>{prev_jr}</strong>. '
+                f'Now being submitted for a different job: <strong>{new_jr}</strong>.'
+            )
+        else:
+            fyi_msg = (
+                f'Previously submitted to client <strong>{prev_client}</strong> '
+                f'for job <strong>{prev_jr}</strong>. '
+                f'Now submitted to client <strong>{new_client}</strong> '
+                f'for job <strong>{new_jr}</strong>.'
+            )
+
+        html += (
+            f'</table>'
+            f'<div style="margin:12px 0;padding:14px 16px;background:#fff3e0;'
+            f'border-left:4px solid #e65100;border-radius:4px;font-size:13px;color:#bf360c">'
+            f'<strong>FYI — no action required.</strong><br>{fyi_msg}'
+            f'<br><br>The record has been added to the database.'
+            f'</div>'
+        )
+
+        if existing_record:
+            html += (
+                f'<p style="font-size:12px;color:#555;margin:8px 0 4px">'
+                f'Highlighted rows have different values between the two submissions.</p>'
+                f'{_comparison_table_html(existing_record, rd)}'
+            )
+
+        html += '</div></div>'
+        return html
+
+    elif dup:
+        orig_name = (
+            diff_recruiter
+            or existing_record.get("recruiter")
+            or "another recruiter"
+        )
         dup_meta = {
-            "Duplicate":          ("🔴", "#ffebee", "#ef5350", "#7f0000",
-                                   "Same phone AND email already exist in the DB. Record inserted and flagged."),
-            "Duplicate Cell":     ("🟠", "#fff3e0", "#ffa726", "#5d4037",
-                                   "Same phone number already exists (different email). Record inserted and flagged."),
-            "Duplicate Email":    ("🟠", "#fff3e0", "#ffa726", "#5d4037",
-                                   "Same email address already exists (different phone). Record inserted and flagged."),
-            "Duplicate Recruiter":("🔴", "#ffebee", "#ef5350", "#7f0000",
-                                   "Same candidate (phone + email + JR/skill) was already submitted by a different "
-                                   "recruiter within the duplicate check window. Record inserted and flagged. "
-                                   "Both recruiters and manager have been notified."),
-            "Duplicate Contact":  ("🟠", "#fff3e0", "#ffa726", "#5d4037",
-                                   "Same phone or email exists in the DB under a different JR/skill or recruiter "
-                                   "within the duplicate check window. Record inserted and flagged."),
+            "Duplicate Recruiter": ("🔴", "#ffebee", "#ef5350", "#7f0000",
+                                    f"Same candidate (phone + email + JR/skill) was already submitted by "
+                                    f"<strong>{orig_name}</strong> on "
+                                    f"<strong>{_val(existing_record.get('date')) or '—'}</strong> "
+                                    f"(check window: {DUPLICATE_CHECK_MONTHS} month(s)). "
+                                    f"Record inserted and flagged. Both recruiters and manager have been notified."),
+            "Duplicate":           ("🔴", "#ffebee", "#ef5350", "#7f0000",
+                                    f"Same phone AND email already exist in the DB "
+                                    f"(check window: {DUPLICATE_CHECK_MONTHS} month(s)). Record inserted and flagged."),
+            "Duplicate Cell":      ("🟠", "#fff3e0", "#ffa726", "#5d4037",
+                                    f"Same phone number already exists — different email "
+                                    f"(check window: {DUPLICATE_CHECK_MONTHS} month(s)). Record inserted and flagged."),
+            "Duplicate Email":     ("🟠", "#fff3e0", "#ffa726", "#5d4037",
+                                    f"Same email address already exists — different phone "
+                                    f"(check window: {DUPLICATE_CHECK_MONTHS} month(s)). Record inserted and flagged."),
+            "Duplicate Contact":   ("🟠", "#fff3e0", "#ffa726", "#5d4037",
+                                    f"Same phone or email found under a different JR/skill or recruiter "
+                                    f"(check window: {DUPLICATE_CHECK_MONTHS} month(s)). Record inserted and flagged."),
         }
         icon, bg, border, txt_color, note = dup_meta.get(
             dup, ("⚠️", "#fff8e1", "#ffc107", "#5d4037", dup)
@@ -438,7 +532,21 @@ def build_email_html(
             'email body.</p></div></div>'
         )
 
-    # Build summary bar — only show non-zero stats to keep it clean
+    # Build summary bar — all colours are inline so Outlook doesn't strip them
+    _STAT_STYLES = {
+        "ins":  ("#e8f5e9", "#a5d6a7", "#2e7d32"),
+        "upd":  ("#e3f2fd", "#90caf9", "#1565c0"),
+        "skip": ("#fff8e1", "#ffe082", "#f57f17"),
+        "conf": ("#f3e5f5", "#ce93d8", "#6a1b9a"),
+        "err":  ("#ffebee", "#ef9a9a", "#c62828"),
+    }
+    _STAT_BASE = (
+        "flex:1;min-width:110px;padding:14px 18px;border-radius:6px;"
+        "text-align:center;display:inline-block;"
+    )
+    _NUM_BASE  = "font-size:26px;font-weight:700;display:block;"
+    _LBL_BASE  = "font-size:12px;display:block;"
+
     stat_blocks = [
         ("ins",  email_inserted,  "Inserted"),
         ("upd",  email_updated,   "Updated"),
@@ -447,17 +555,18 @@ def build_email_html(
         ("err",  email_errors,    "Errors"),
     ]
     stats_html = "".join(
-        f'<div class="stat {cls}">'
-        f'<span class="num">{count}</span>'
-        f'<span class="lbl">{lbl}</span>'
+        f'<div style="{_STAT_BASE}background:{bg};border:1px solid {bd};">'
+        f'<span style="{_NUM_BASE}color:{nc};">{count}</span>'
+        f'<span style="{_LBL_BASE}color:#555555;">{lbl}</span>'
         f'</div>'
         for cls, count, lbl in stat_blocks
+        for bg, bd, nc in [_STAT_STYLES[cls]]
     )
     # Always show Total
     stats_html += (
-        f'<div class="stat" style="background:#e8eaf6;border:1px solid #9fa8da">'
-        f'<span class="num" style="color:#283593">{total}</span>'
-        f'<span class="lbl">Total</span>'
+        f'<div style="{_STAT_BASE}background:#e8eaf6;border:1px solid #9fa8da;">'
+        f'<span style="{_NUM_BASE}color:#283593;">{total}</span>'
+        f'<span style="{_LBL_BASE}color:#555555;">Total</span>'
         f'</div>'
     )
 
@@ -471,7 +580,7 @@ def build_email_html(
     </p>
   </div>
   <div class="body" style="padding:24px 32px;background:#ffffff;color:#1a1a2e;font-family:'Segoe UI',Arial,sans-serif">
-    <div class="summary-bar">{stats_html}</div>
+    <div style="display:flex;gap:12px;margin-bottom:24px;flex-wrap:wrap;">{stats_html}</div>
     {cards_html}
   </div>
   <div class="footer" style="padding:16px 32px;background:#f8f9fa;font-size:11px;color:#9e9e9e;border-top:1px solid #e0e0e0">
@@ -628,6 +737,134 @@ def send_diff_recruiter_notification_email(
     }
 
     _send_graph_mail(token, payload, new_recruiter_addr, label="diff-recruiter notification")
+
+
+def send_multi_client_notification_email(
+    token: str,
+    recruiter_addr: str,
+    existing_row: dict,
+    new_record_data: dict,
+    original_subject: str,
+    same_job: bool,
+    same_client: bool,
+    inserted_ok: bool,
+) -> None:
+    """
+    Notify the recruiter when they share the same candidate to a different
+    client (same or different job).  Record is already inserted.
+    """
+    if not ENABLE_NOTIFICATIONS:
+        log.info("Notifications disabled — skipping multi-client notification.")
+        return
+
+    candidate_name  = (
+        _val(new_record_data.get("name_of_candidate"))
+        or _val(existing_row.get("name_of_candidate"))
+        or "Unknown Candidate"
+    )
+    recruiter_name  = _val(new_record_data.get("recruiter")) or "the recruiter"
+    new_client      = _val(new_record_data.get("client_recruiter")) or "—"
+    prev_client     = _val(existing_row.get("client_recruiter"))    or "—"
+    new_jr          = _val(new_record_data.get("jr_no"))    or _val(new_record_data.get("general_skill")) or "—"
+    prev_jr         = _val(existing_row.get("jr_no"))       or _val(existing_row.get("general_skill"))    or "—"
+    new_date        = _val(new_record_data.get("date"))     or datetime.now().strftime("%d %b %Y")
+    now_str         = datetime.now().strftime("%d %b %Y, %I:%M %p")
+
+    if same_job and not same_client:
+        scenario_title = "Same Candidate Shared to a Different Client (Same Job)"
+        body_text = (
+            f'The candidate <strong>{candidate_name}</strong> was submitted for '
+            f'job <strong>{new_jr}</strong> on <strong>{new_date}</strong> '
+            f'by recruiter <strong>{recruiter_name}</strong> to client '
+            f'<strong>{new_client}</strong>.<br>'
+            f'The same candidate was previously submitted for the <strong>same job</strong> '
+            f'to client <strong>{prev_client}</strong>.'
+        )
+    elif not same_job and same_client:
+        scenario_title = "Same Candidate Shared for a Different Job (Same Client)"
+        body_text = (
+            f'The candidate <strong>{candidate_name}</strong> was submitted to client '
+            f'<strong>{new_client}</strong> for job <strong>{new_jr}</strong> '
+            f'on <strong>{new_date}</strong> by recruiter <strong>{recruiter_name}</strong>.<br>'
+            f'The same candidate was previously submitted to the <strong>same client</strong> '
+            f'for a different job: <strong>{prev_jr}</strong>.'
+        )
+    else:
+        scenario_title = "Same Candidate Shared to a Different Client for a Different Job"
+        body_text = (
+            f'The candidate <strong>{candidate_name}</strong> was submitted to client '
+            f'<strong>{new_client}</strong> for job <strong>{new_jr}</strong> '
+            f'on <strong>{new_date}</strong> by recruiter <strong>{recruiter_name}</strong>.<br>'
+            f'The same candidate was previously submitted to client '
+            f'<strong>{prev_client}</strong> for job <strong>{prev_jr}</strong>.'
+        )
+
+    status_line = (
+        "The new record has been added to the database."
+        if inserted_ok
+        else "The record could not be inserted — please contact your administrator."
+    )
+
+    subject_line = (
+        f"[HR Bot] {scenario_title} — {candidate_name} | {original_subject}"
+    )
+
+    comparison_html = _comparison_table_html(existing_row, new_record_data)
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>{_CSS}</style></head>
+<body><div class="wrap">
+
+  <div class="hdr" style="background:#e65100">
+    <h1 style="margin:0;font-size:20px;color:#ffffff;font-family:'Segoe UI',Arial,sans-serif">
+      FYI: {scenario_title}
+    </h1>
+    <p style="margin:6px 0 0;color:#ffffff;font-size:13px;font-family:'Segoe UI',Arial,sans-serif">
+      Detected at: {now_str}
+    </p>
+  </div>
+
+  <div class="body" style="padding:24px 32px;background:#ffffff;color:#1a1a2e;font-family:'Segoe UI',Arial,sans-serif">
+
+    <div style="background:#fff3e0;border:1px solid #ffcc80;border-radius:6px;
+                padding:14px 20px;margin-bottom:20px;font-size:14px;color:#bf360c">
+      <strong>FYI — no action required.</strong><br>
+      {body_text}<br><br>
+      {status_line}
+    </div>
+
+    <h3 style="margin:0 0 12px;color:#e65100;font-family:'Segoe UI',Arial,sans-serif">Field Comparison</h3>
+    <p style="font-size:12px;color:#888888;margin:0 0 10px;font-family:'Segoe UI',Arial,sans-serif">
+      Highlighted rows have different values between the two submissions.
+    </p>
+    {comparison_html}
+
+  </div>
+
+  <div class="footer" style="padding:16px 32px;background:#f8f9fa;font-size:11px;color:#9e9e9e;border-top:1px solid #e0e0e0">
+    This is an automated informational message from {TARGET_MAILBOX}.<br>
+    No action is required — the record has been added automatically.
+  </div>
+
+</div></body></html>"""
+
+    cc_list: list = []
+    for addr in NOTIFY_CC_EMAILS.split(","):
+        addr = addr.strip()
+        if addr:
+            cc_list.append({"emailAddress": {"address": addr}})
+
+    payload = {
+        "message": {
+            "subject":      subject_line,
+            "body":         {"contentType": "HTML", "content": html},
+            "toRecipients": [{"emailAddress": {"address": recruiter_addr}}],
+            "ccRecipients": cc_list,
+        },
+        "saveToSentItems": "false",
+    }
+
+    _send_graph_mail(token, payload, recruiter_addr, label="multi-client notification")
 
 
 # ─── Shared Graph send helper ────────────────────────────────────────────────────

@@ -718,7 +718,21 @@ def parse_html_table(html: str) -> tuple[list[dict], bool]:
             cleaned = [_clean_cell(c) for c in cells]
             if all(v == "" for v in cleaned):
                 continue
+            # Skip section-header / sub-header rows: too few cells relative to
+            # the header, or the only populated cell is a parenthetical label
+            # like "(Databricks)" which is never a real candidate name.
+            non_empty = sum(1 for v in cleaned if v)
+            if non_empty < 3 and len(col_map) >= 5:
+                log.debug(f"  Skipping sub-header row (only {non_empty} non-empty cells): {cleaned}")
+                continue
             record = {col_map[i]: v for i, v in enumerate(cleaned) if i in col_map}
+            # Also skip if the only populated field is a parenthetical section label
+            candidate_name = record.get("name_of_candidate", "")
+            if (candidate_name
+                    and re.fullmatch(r"\(.*\)", candidate_name.strip())
+                    and non_empty <= 2):
+                log.debug(f"  Skipping parenthetical section-label row: {candidate_name!r}")
+                continue
             if record:
                 rows.append(record)
 
