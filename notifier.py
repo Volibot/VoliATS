@@ -654,10 +654,11 @@ def send_diff_recruiter_notification_email(
     or _val(existing_row.get("name_of_candidate"))
     or "Unknown Candidate"
 )
-    existing_recruiter = existing_row.get("recruiter", "—")
-    new_recruiter      = new_record_data.get("recruiter", "—")
-    insert_date        = _val(new_record_data.get("date")) or datetime.now().strftime("%d %b %Y")
-    now_str            = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    existing_recruiter       = existing_row.get("recruiter", "—")
+    new_recruiter            = new_record_data.get("recruiter", "—")
+    insert_date              = _val(new_record_data.get("date")) or datetime.now().strftime("%d %b %Y")
+    existing_created_date    = _val(existing_row.get("created_date")) or "an earlier date"
+    now_str                  = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
     status_line = (
         "The record has been added to the database."
@@ -690,7 +691,7 @@ def send_diff_recruiter_notification_email(
       <strong>{jr_no}</strong> on <strong>{insert_date}</strong>
       by recruiter <strong>{new_recruiter}</strong>.<br>
       An earlier record for the same candidate already exists, added by
-      <strong>{existing_recruiter}</strong>.<br><br>
+      <strong>{existing_recruiter}</strong> on <strong>{existing_created_date}</strong>.<br><br>
       {status_line}
     </div>
 

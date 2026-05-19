@@ -894,9 +894,7 @@ def find_same_key_record(
           )
           AND (LOWER(COALESCE(jr_no,           '')) = LOWER(COALESCE(%s, ''))
                OR LOWER(COALESCE(general_skill,'')) = LOWER(COALESCE(%s, '')))
-          AND LOWER(COALESCE(client_recruiter, '')) = LOWER(COALESCE(%s, ''))
           AND LOWER(COALESCE(recruiter,        '')) = LOWER(COALESCE(%s, ''))
-          AND LOWER(COALESCE(delivery_type,    '')) = LOWER(COALESCE(%s, ''))
         LIMIT 1
     """).format(
         cols=pgsql.SQL(", ").join(pgsql.Identifier(c) for c in cols),
@@ -907,7 +905,7 @@ def find_same_key_record(
         contact_number, contact_number,
         email_id,       email_id,
         jr_no, general_skill,
-        client_recruiter, recruiter, delivery_type,
+        recruiter,
     ))
     row = cur.fetchone()
     return dict(zip(cols, row)) if row else None
