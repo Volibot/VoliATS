@@ -768,6 +768,7 @@ def send_multi_client_notification_email(
     new_jr          = _val(new_record_data.get("jr_no"))    or _val(new_record_data.get("general_skill")) or "—"
     prev_jr         = _val(existing_row.get("jr_no"))       or _val(existing_row.get("general_skill"))    or "—"
     new_date        = _val(new_record_data.get("date"))     or datetime.now().strftime("%d %b %Y")
+    prev_date       = _val(existing_row.get("created_date")) or "an earlier date"
     now_str         = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
     if same_job and not same_client:
@@ -778,7 +779,7 @@ def send_multi_client_notification_email(
             f'by recruiter <strong>{recruiter_name}</strong> to client '
             f'<strong>{new_client}</strong>.<br>'
             f'The same candidate was previously submitted for the <strong>same job</strong> '
-            f'to client <strong>{prev_client}</strong>.'
+            f'to client <strong>{prev_client}</strong> on <strong>{prev_date}</strong>.'
         )
     elif not same_job and same_client:
         scenario_title = "Same Candidate Shared for a Different Job (Same Client)"
@@ -787,7 +788,7 @@ def send_multi_client_notification_email(
             f'<strong>{new_client}</strong> for job <strong>{new_jr}</strong> '
             f'on <strong>{new_date}</strong> by recruiter <strong>{recruiter_name}</strong>.<br>'
             f'The same candidate was previously submitted to the <strong>same client</strong> '
-            f'for a different job: <strong>{prev_jr}</strong>.'
+            f'for a different job: <strong>{prev_jr}</strong> on <strong>{prev_date}</strong>.'
         )
     else:
         scenario_title = "Same Candidate Shared to a Different Client for a Different Job"
@@ -796,7 +797,7 @@ def send_multi_client_notification_email(
             f'<strong>{new_client}</strong> for job <strong>{new_jr}</strong> '
             f'on <strong>{new_date}</strong> by recruiter <strong>{recruiter_name}</strong>.<br>'
             f'The same candidate was previously submitted to client '
-            f'<strong>{prev_client}</strong> for job <strong>{prev_jr}</strong>.'
+            f'<strong>{prev_client}</strong> for job <strong>{prev_jr}</strong> on <strong>{prev_date}</strong>.'
         )
 
     status_line = (
