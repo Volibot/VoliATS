@@ -348,7 +348,7 @@ def _candidate_card_html(row_summary: dict) -> str:
     if dup == "Duplicate Recruiter" and outcome == "inserted":
         # ── FYI block showing original submitter + field comparison ──────────
         orig          = diff_recruiter or existing_record.get("recruiter") or "another recruiter"
-        orig_date     = _val(existing_record.get("date")) or "—"
+        orig_date     = _val(existing_record.get("created_date")) or "—"
         new_recruiter_display = _val(rd.get("recruiter")) or "this recruiter"
         jr_or_skill   = _val(rd.get("jr_no")) or _val(rd.get("general_skill")) or "—"
         date_display  = _val(rd.get("date")) or "—"
@@ -384,23 +384,26 @@ def _candidate_card_html(row_summary: dict) -> str:
         new_client  = _val(rd.get("client_recruiter")) or "—"
         prev_jr     = _val(existing_record.get("jr_no")) or _val(existing_record.get("general_skill")) or "—"
         new_jr      = _val(rd.get("jr_no")) or _val(rd.get("general_skill")) or "—"
+        prev_date   = _val(existing_record.get("created_date")) or "an earlier date"
 
         if same_job and not same_client:
             fyi_msg = (
                 f'The same candidate was previously submitted for the <strong>same job</strong> '
-                f'(<strong>{new_jr}</strong>) to client <strong>{prev_client}</strong>. '
+                f'(<strong>{new_jr}</strong>) to client <strong>{prev_client}</strong> '
+                f'on <strong>{prev_date}</strong>. '
                 f'Now being submitted to client <strong>{new_client}</strong>.'
             )
         elif not same_job and same_client:
             fyi_msg = (
                 f'The same candidate was previously submitted to the <strong>same client</strong> '
-                f'(<strong>{new_client}</strong>) for job <strong>{prev_jr}</strong>. '
+                f'(<strong>{new_client}</strong>) for job <strong>{prev_jr}</strong> '
+                f'on <strong>{prev_date}</strong>. '
                 f'Now being submitted for a different job: <strong>{new_jr}</strong>.'
             )
         else:
             fyi_msg = (
                 f'Previously submitted to client <strong>{prev_client}</strong> '
-                f'for job <strong>{prev_jr}</strong>. '
+                f'for job <strong>{prev_jr}</strong> on <strong>{prev_date}</strong>. '
                 f'Now submitted to client <strong>{new_client}</strong> '
                 f'for job <strong>{new_jr}</strong>.'
             )
@@ -434,7 +437,7 @@ def _candidate_card_html(row_summary: dict) -> str:
             "Duplicate Recruiter": ("🔴", "#ffebee", "#ef5350", "#7f0000",
                                     f"Same candidate (phone + email + JR/skill) was already submitted by "
                                     f"<strong>{orig_name}</strong> on "
-                                    f"<strong>{_val(existing_record.get('date')) or '—'}</strong> "
+                                    f"<strong>{_val(existing_record.get('created_date')) or '—'}</strong> "
                                     f"(check window: {DUPLICATE_CHECK_MONTHS} month(s)). "
                                     f"Record inserted and flagged. Both recruiters and manager have been notified."),
             "Duplicate":           ("🔴", "#ffebee", "#ef5350", "#7f0000",
