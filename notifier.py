@@ -518,12 +518,14 @@ def build_email_html(
     now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
     total   = email_inserted + email_skipped + email_errors + email_updated + email_conflicts
 
+    _HDR_COLORS = {"pass": "#1a7a4a", "fail": "#b71c1c", "partial": "#e65100", "conflict": "#6a1b9a"}
     if email_errors == 0 and email_skipped == 0 and email_conflicts == 0 and email_inserted > 0:
         overall, hdr_cls, hdr_icon = "All Passed", "pass", "✅"
     elif email_inserted == 0 and email_updated == 0 and email_skipped == 0 and email_conflicts == 0:
         overall, hdr_cls, hdr_icon = "All Failed", "fail", "❌"
     else:
         overall, hdr_cls, hdr_icon = "Partially Processed", "partial", "⚠️"
+    hdr_bg = _HDR_COLORS.get(hdr_cls, "#1a7a4a")
 
     subject_line = f"[HR Bot] {hdr_icon} {overall} — {original_subject}"
 
@@ -576,7 +578,7 @@ def build_email_html(
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>{_CSS}</style></head>
 <body><div class="wrap">
-  <div class="hdr {hdr_cls}">
+  <div class="hdr {hdr_cls}" style="padding:24px 32px;background:{hdr_bg};">
     <h1 style="margin:0;font-size:20px;color:#ffffff;font-family:'Segoe UI',Arial,sans-serif">{hdr_icon} HR Bot Processing Report</h1>
     <p style="margin:6px 0 0;color:#ffffff;font-size:13px;font-family:'Segoe UI',Arial,sans-serif">
       Submitted by: <strong>{from_addr}</strong> &nbsp;|&nbsp; Processed at: {now_str}
