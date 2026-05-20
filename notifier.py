@@ -348,7 +348,8 @@ def _candidate_card_html(row_summary: dict) -> str:
     if dup == "Duplicate Recruiter" and outcome == "inserted":
         # ── FYI block showing original submitter + field comparison ──────────
         orig          = diff_recruiter or existing_record.get("recruiter") or "another recruiter"
-        orig_date     = _val(existing_record.get("created_date")) or "—"
+        _orig_ts          = _val(existing_record.get("created_date")) or _val(existing_record.get("date"))
+        orig_date_phrase  = f'on <strong>{_orig_ts}</strong> ' if _orig_ts else ""
         new_recruiter_display = _val(rd.get("recruiter")) or "this recruiter"
         jr_or_skill   = _val(rd.get("jr_no")) or _val(rd.get("general_skill")) or "—"
         date_display  = _val(rd.get("date")) or "—"
@@ -361,8 +362,8 @@ def _candidate_card_html(row_summary: dict) -> str:
             f'The candidate <strong>{name}</strong> was submitted for '
             f'<strong>{jr_or_skill}</strong> on <strong>{date_display}</strong> '
             f'by recruiter <strong>{new_recruiter_display}</strong>.<br>'
-            f'An earlier record for the same candidate already exists, first submitted on '
-            f'<strong>{orig_date}</strong> by <strong>{orig}</strong>.'
+            f'An earlier record for the same candidate already exists, first submitted '
+            f'{orig_date_phrase}by <strong>{orig}</strong>.'
             f'<br><br>The record has been added to the database.'
             f'</div>'
         )
@@ -384,26 +385,27 @@ def _candidate_card_html(row_summary: dict) -> str:
         new_client  = _val(rd.get("client_recruiter")) or "—"
         prev_jr     = _val(existing_record.get("jr_no")) or _val(existing_record.get("general_skill")) or "—"
         new_jr      = _val(rd.get("jr_no")) or _val(rd.get("general_skill")) or "—"
-        prev_date   = _val(existing_record.get("created_date")) or "an earlier date"
+        _prev_ts         = _val(existing_record.get("created_date")) or _val(existing_record.get("date"))
+        prev_date_phrase = f'on <strong>{_prev_ts}</strong> ' if _prev_ts else ""
 
         if same_job and not same_client:
             fyi_msg = (
                 f'The same candidate was previously submitted for the <strong>same job</strong> '
                 f'(<strong>{new_jr}</strong>) to client <strong>{prev_client}</strong> '
-                f'on <strong>{prev_date}</strong>. '
+                f'{prev_date_phrase}. '
                 f'Now being submitted to client <strong>{new_client}</strong>.'
             )
         elif not same_job and same_client:
             fyi_msg = (
                 f'The same candidate was previously submitted to the <strong>same client</strong> '
                 f'(<strong>{new_client}</strong>) for job <strong>{prev_jr}</strong> '
-                f'on <strong>{prev_date}</strong>. '
+                f'{prev_date_phrase}. '
                 f'Now being submitted for a different job: <strong>{new_jr}</strong>.'
             )
         else:
             fyi_msg = (
                 f'Previously submitted to client <strong>{prev_client}</strong> '
-                f'for job <strong>{prev_jr}</strong> on <strong>{prev_date}</strong>. '
+                f'for job <strong>{prev_jr}</strong> {prev_date_phrase}. '
                 f'Now submitted to client <strong>{new_client}</strong> '
                 f'for job <strong>{new_jr}</strong>.'
             )
@@ -433,11 +435,12 @@ def _candidate_card_html(row_summary: dict) -> str:
             or existing_record.get("recruiter")
             or "another recruiter"
         )
+        _dup_ts          = _val(existing_record.get("created_date")) or _val(existing_record.get("date"))
+        dup_date_phrase  = f'on <strong>{_dup_ts}</strong> ' if _dup_ts else ""
         dup_meta = {
             "Duplicate Recruiter": ("🔴", "#ffebee", "#ef5350", "#7f0000",
                                     f"Same candidate (phone + email + JR/skill) was already submitted by "
-                                    f"<strong>{orig_name}</strong> on "
-                                    f"<strong>{_val(existing_record.get('created_date')) or '—'}</strong> "
+                                    f"<strong>{orig_name}</strong> {dup_date_phrase}"
                                     f"(check window: {DUPLICATE_CHECK_MONTHS} month(s)). "
                                     f"Record inserted and flagged. Both recruiters and manager have been notified."),
             "Duplicate":           ("🔴", "#ffebee", "#ef5350", "#7f0000",
@@ -662,7 +665,8 @@ def send_diff_recruiter_notification_email(
     existing_recruiter       = existing_row.get("recruiter", "—")
     new_recruiter            = new_record_data.get("recruiter", "—")
     insert_date              = _val(new_record_data.get("date")) or datetime.now().strftime("%d %b %Y")
-    existing_created_date    = _val(existing_row.get("created_date")) or "an earlier date"
+    _existing_ts             = _val(existing_row.get("created_date")) or _val(existing_row.get("date"))
+    existing_date_phrase     = f'on <strong>{_existing_ts}</strong> ' if _existing_ts else ""
     now_str                  = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
     status_line = (
@@ -696,7 +700,7 @@ def send_diff_recruiter_notification_email(
       <strong>{jr_no}</strong> on <strong>{insert_date}</strong>
       by recruiter <strong>{new_recruiter}</strong>.<br>
       An earlier record for the same candidate already exists, added by
-      <strong>{existing_recruiter}</strong> on <strong>{existing_created_date}</strong>.<br><br>
+      <strong>{existing_recruiter}</strong> {existing_date_phrase}(existing record).<br><br>
       {status_line}
     </div>
 
@@ -774,7 +778,8 @@ def send_multi_client_notification_email(
     new_jr          = _val(new_record_data.get("jr_no"))    or _val(new_record_data.get("general_skill")) or "—"
     prev_jr         = _val(existing_row.get("jr_no"))       or _val(existing_row.get("general_skill"))    or "—"
     new_date        = _val(new_record_data.get("date"))     or datetime.now().strftime("%d %b %Y")
-    prev_date       = _val(existing_row.get("created_date")) or "an earlier date"
+    _prev_ts        = _val(existing_row.get("created_date")) or _val(existing_row.get("date"))
+    prev_date_phrase = f'on <strong>{_prev_ts}</strong> ' if _prev_ts else ""
     now_str         = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
     if same_job and not same_client:
@@ -785,7 +790,7 @@ def send_multi_client_notification_email(
             f'by recruiter <strong>{recruiter_name}</strong> to client '
             f'<strong>{new_client}</strong>.<br>'
             f'The same candidate was previously submitted for the <strong>same job</strong> '
-            f'to client <strong>{prev_client}</strong> on <strong>{prev_date}</strong>.'
+            f'to client <strong>{prev_client}</strong> {prev_date_phrase}(existing record).'
         )
     elif not same_job and same_client:
         scenario_title = "Same Candidate Shared for a Different Job (Same Client)"
@@ -794,7 +799,7 @@ def send_multi_client_notification_email(
             f'<strong>{new_client}</strong> for job <strong>{new_jr}</strong> '
             f'on <strong>{new_date}</strong> by recruiter <strong>{recruiter_name}</strong>.<br>'
             f'The same candidate was previously submitted to the <strong>same client</strong> '
-            f'for a different job: <strong>{prev_jr}</strong> on <strong>{prev_date}</strong>.'
+            f'for a different job: <strong>{prev_jr}</strong> {prev_date_phrase}(existing record).'
         )
     else:
         scenario_title = "Same Candidate Shared to a Different Client for a Different Job"
@@ -803,7 +808,7 @@ def send_multi_client_notification_email(
             f'<strong>{new_client}</strong> for job <strong>{new_jr}</strong> '
             f'on <strong>{new_date}</strong> by recruiter <strong>{recruiter_name}</strong>.<br>'
             f'The same candidate was previously submitted to client '
-            f'<strong>{prev_client}</strong> for job <strong>{prev_jr}</strong> on <strong>{prev_date}</strong>.'
+            f'<strong>{prev_client}</strong> for job <strong>{prev_jr}</strong> {prev_date_phrase}(existing record).'
         )
 
     status_line = (
