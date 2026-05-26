@@ -25,6 +25,7 @@ jobs:
       NOTIFY_CC_EMAILS:     ${{ secrets.NOTIFY_CC_EMAILS }}
       Limit:                ${{ secrets.Limit }}
       ENABLE_NOTIFICATIONS: "true"
+      LOOKBACK_HOURS:       "48"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

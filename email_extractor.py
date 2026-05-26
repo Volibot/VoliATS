@@ -32,7 +32,7 @@ import requests
 import psycopg2
 from psycopg2 import sql as pgsql
 from html import unescape
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 from msal import ConfidentialClientApplication, PublicClientApplication
 from notifier import (
@@ -80,16 +80,7 @@ RESUME_EXTENSIONS   = {".pdf", ".doc", ".docx"}
 # Number of months of history to consider when checking for duplicates.
 DUPLICATE_CHECK_MONTHS = int(os.environ.get("DUPLICATE_CHECK_MONTHS", "3"))
 
-# Optional end-date filter: only emails received on or before this date are
-# processed.  Format: YYYY-MM-DD.  Defaults to today when not set.
-# Example: END_DATE=2025-04-20 → reads emails from today back to 2025-04-20.
-_end_date_raw = os.environ.get("END_DATE", "").strip()
-try:
-    END_DATE: date = datetime.strptime(_end_date_raw, "%Y-%m-%d").date() if _end_date_raw else date.today()
-except ValueError:
-    raise SystemExit(
-        f"END_DATE env var '{_end_date_raw}' is not a valid YYYY-MM-DD date."
-    )
+LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "48"))
 
 # Fields that may be auto-filled when NULL/empty in an existing record.
 # Identity fields (name/contact/email) come first so a previously-incomplete
@@ -295,7 +286,7 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
 
 
 # ─── Fetch emails ──────────────────────────────────────────────────────────────
-def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None, end_date: Optional[date] = None) -> list[dict]:
+def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> list[dict]:
     """
     Fetch emails page by page WITHOUT expanding attachments inline.
 
@@ -306,10 +297,7 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None, end
     Attachments are fetched separately per message on demand inside
     upload_attachments() → _fetch_attachment_content().
 
-    end_date: if provided, only emails received on or before this date (up to
-    23:59:59 UTC of that day) are fetched via a Graph API $filter.  Emails are
-    always ordered newest-first, so pagination stops as soon as an email older
-    than the window is encountered.
+    The lookback window is controlled by LOOKBACK_HOURS (default 48).
     """
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -321,11 +309,9 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None, end
     else:
         base = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages"
 
-    _today_iso    = datetime.utcnow().strftime("%Y-%m-%dT23:59:59Z")
-    _end_date_iso = (
-        f"{end_date.strftime('%Y-%m-%d')}T00:00:00Z"
-        if end_date else "1970-01-01T00:00:00Z"
-    )
+    now_utc = datetime.utcnow()
+    _today_iso    = now_utc.strftime("%Y-%m-%dT23:59:59Z")
+    _end_date_iso = (now_utc - timedelta(hours=LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     _date_filter = (
         f"receivedDateTime ge {_end_date_iso}"
         f" and receivedDateTime le {_today_iso}"
@@ -1248,7 +1234,7 @@ def process_emails() -> None:
     log.info(f"OneDrive user  : {ONEDRIVE_USER}")
     log.info(f"OneDrive folder: {ONEDRIVE_FOLDER}")
     log.info(f"Inbox subfolder: {INBOX_SUBFOLDER or '(root inbox)'}")
-    log.info(f"Date filter    : {END_DATE} → today ({date.today()})")
+    log.info(f"Lookback       : {LOOKBACK_HOURS} hours")
 
     token    = get_mail_token()
     od_token = get_onedrive_token()
@@ -1279,7 +1265,7 @@ def process_emails() -> None:
     ensure_tables(cur)
     conn.commit()
 
-    emails = fetch_emails(token, top=Limit, folder_id=inbox_folder_id, end_date=END_DATE)
+    emails = fetch_emails(token, top=Limit, folder_id=inbox_folder_id)
 
     processed = skipped = inserted = updated = conflicts = errors = 0
 
