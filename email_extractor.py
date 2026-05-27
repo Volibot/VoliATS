@@ -171,8 +171,6 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "position", "job title", "job_title", "title",
     ],
 }
-
-
 # ─── Build alias lookup once at startup ────────────────────────────────────────
 def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())

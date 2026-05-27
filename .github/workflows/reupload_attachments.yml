@@ -1,0 +1,55 @@
+name: Re-upload Attachments to OneDrive
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (no DB changes, preview only)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+jobs:
+  reupload:
+    name: Re-upload & Update Attachment Links
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AZURE_TENANT_ID:      ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID:      ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET:  ${{ secrets.AZURE_CLIENT_SECRET }}
+      OD_TENANT_ID:         ${{ secrets.OD_TENANT_ID }}
+      OD_CLIENT_ID:         ${{ secrets.OD_CLIENT_ID }}
+      OD_CLIENT_SECRET:     ${{ secrets.OD_CLIENT_SECRET }}
+      OD_REFRESH_TOKEN:     ${{ secrets.OD_REFRESH_TOKEN }}
+      ONEDRIVE_USER:        ${{ secrets.ONEDRIVE_USER }}
+      TARGET_MAILBOX:       ${{ secrets.TARGET_MAILBOX }}
+      DB_DSN:               ${{ secrets.DB_DSN }}
+      DB_TABLE_NAME:        ${{ secrets.DB_TABLE_NAME }}
+      ONEDRIVE_FOLDER:      ${{ secrets.ONEDRIVE_FOLDER }}
+      LOOKBACK_HOURS:       "48"
+      ENABLE_NOTIFICATIONS: "false"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run re-upload (dry run)
+        if: ${{ inputs.dry_run == 'true' }}
+        run: python reupload_attachments.py --dry-run
+      - name: Run re-upload (live)
+        if: ${{ inputs.dry_run == 'false' }}
+        run: python reupload_attachments.py
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reupload-log-${{ github.run_id }}
+          path: reupload.log
+          retention-days: 7
