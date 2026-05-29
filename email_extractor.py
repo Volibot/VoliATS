@@ -118,7 +118,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     ],
     "email_id": [
         "email id", "email_id", "email", "e-mail", "mail id", "mail_id",
-        "email address", "email_address", "e mail",
+        "email address", "email_address", "e mail", "E-Mail Id",
     ],
     "current_org": [
         "current company", "current_company", "company", "employer",
