@@ -374,6 +374,7 @@ def mark_email_read(token: str, message_id: str) -> None:
 # ─── Subject parsing ───────────────────────────────────────────────────────────
 SUBJECT_RE = re.compile(r"^(?P<code>[A-Z]{2,5})\s*:\s*(?P<rest>.+)$", re.IGNORECASE)
 IGNORE_RE  = re.compile(r"^(fw|fwd|re|aw)\s*:", re.IGNORECASE)
+DUPLICATE_SUBJECT_RE = re.compile(r"\bduplicate\b", re.IGNORECASE)
 
 _JR_PATTERNS = [
     re.compile(r"[-|]\s*(?:jr\.?\s*(?:no\.?\s*)?)(?P<jr>\d{4,})\s*$",   re.IGNORECASE),
@@ -448,6 +449,12 @@ def parse_subject(subject: str) -> Optional[tuple[str, str, Optional[str]]]:
     jr_no, skill = _extract_jr_and_skill(m.group("rest"))
     log.debug(f"Parsed subject → company={company_name!r} skill={skill!r} jr_no={jr_no!r}")
     return company_name, skill, jr_no
+
+
+def _final_status_from_subject(subject: str) -> str:
+    if DUPLICATE_SUBJECT_RE.search(subject):
+        return "Duplicate"
+    return "Screening Pending"
 
 
 # ─── HTML table parser ─────────────────────────────────────────────────────────
@@ -849,7 +856,7 @@ def mark_email_processed(
 
 # ─── Smart duplicate detection & update ───────────────────────────────────────
 def _select_cols_for_update() -> list[str]:
-    return ["id"] + UPDATABLE_FIELDS
+    return ["id", "final_status"] + UPDATABLE_FIELDS
 
 
 def find_same_key_record(
@@ -1141,7 +1148,7 @@ def _record_status(data: dict) -> str:
 _SAFE_FIELDS = (
     "recruiter", "client_recruiter", "general_skill", "company_name",
     "email_from", "email_to", "delivery_type", "email_id",
-    "name_of_candidate", "contact_number", "is_duplicate", "status",
+    "name_of_candidate", "contact_number", "is_duplicate", "final_status",
     "created_by", "created_date", "modified_by", "modified_date",
     "record_status", "attachment", "remarks",
 )
@@ -1165,7 +1172,7 @@ def _build_insert_sql() -> pgsql.Composable:
             email_from, email_to, delivery_type, company_name,
             attachment, is_duplicate,
             created_by, created_date, modified_by, modified_date,
-            record_status, status, remarks
+            record_status, final_status, remarks
         ) VALUES (
             %(recruiter)s, %(date)s, %(jr_no)s, %(client_recruiter)s, %(general_skill)s,
             %(name_of_candidate)s, %(contact_number)s, %(email_id)s,
@@ -1175,7 +1182,7 @@ def _build_insert_sql() -> pgsql.Composable:
             %(email_from)s, %(email_to)s, %(delivery_type)s, %(company_name)s,
             %(attachment)s, %(is_duplicate)s,
             %(created_by)s, %(created_date)s, %(modified_by)s, %(modified_date)s,
-            %(record_status)s, %(status)s, %(remarks)s
+            %(record_status)s, %(final_status)s, %(remarks)s
         )
     """).format(table=pgsql.Identifier(DB_TABLE))
 
@@ -1285,6 +1292,7 @@ def process_emails() -> None:
             continue
 
         company_name, subject_skill, subject_jr_no = parsed
+        final_status = _final_status_from_subject(subject)
 
         from_addr = _extract_address(msg.get("from", {}))
         to_list   = msg.get("toRecipients", [])
@@ -1386,6 +1394,8 @@ def process_emails() -> None:
                     "attachment":          _t(candidate_attachment) or None,
                     "remarks":             _t(row.get("remarks")),
                 })
+                if final_status == "Duplicate" and same_key.get("final_status") != "Duplicate":
+                    record_updates["final_status"] = final_status
                 if record_updates:
                     apply_field_updates(cur, same_key["id"], record_updates)
                     # If any identity field was filled, recompute record_status
@@ -1500,7 +1510,7 @@ def process_emails() -> None:
                             "email_from":        _t(from_addr),
                             "email_to":          _t(to_addr),
                         }),
-                        "status": "Screen Pending",
+                        "final_status": final_status,
                     }
 
                     ok = insert_record(cur, mc_record_data)
@@ -1595,7 +1605,7 @@ def process_emails() -> None:
                         "email_from":        _t(from_addr),
                         "email_to":          _t(to_addr),
                     }),
-                    "status": "Screen Pending",
+                    "final_status": final_status,
                 }
 
                 ok = insert_record(cur, new_record_data)
@@ -1696,7 +1706,7 @@ def process_emails() -> None:
                     "email_from":        _t(from_addr),
                     "email_to":          _t(to_addr),
                 }),
-                "status": "Screen Pending",
+                "final_status": final_status,
             }
 
             ok = insert_record(cur, record_data)
