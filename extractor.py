@@ -162,7 +162,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "jr no", "jr_no", "jr no.", "jr", "jrno", "req_id", "req id",
         "requisition id", "requisition_id", "jr_number", "jr number",
         "job req", "job requisition", "job_req", "reqid",
-        "requirement id", "requirement_id", "jrno.", "jr#", "JRNo.", "JRNo","JRNO",
+        "requirement id", "requirement_id", "jrno.", "jr#", "JRNo.", "JRNo","JRNO", "jr", "JR"
         "jr no(mention the jr number where profiles are uploaded on sf).",
     ],
     "name_of_candidate": [
