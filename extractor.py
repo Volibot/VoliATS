@@ -156,13 +156,13 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "general_skill": [
         "general_skill", "generalskill", "gen_skill", "genskill",
         "skill", "requirement", "skil", "skills", "technology",
-        "tech", "requirement skill",
+        "tech", "requirement skill", "Core Skills",
     ],
     "jr_no": [
         "jr no", "jr_no", "jr no.", "jr", "jrno", "req_id", "req id",
         "requisition id", "requisition_id", "jr_number", "jr number",
         "job req", "job requisition", "job_req", "reqid",
-        "requirement id", "requirement_id", "jrno.", "jr#",
+        "requirement id", "requirement_id", "jrno.", "jr#", "JRNo.", "JRNo","JRNO",
         "jr no(mention the jr number where profiles are uploaded on sf).",
     ],
     "name_of_candidate": [
