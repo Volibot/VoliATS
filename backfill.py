@@ -76,25 +76,58 @@ def db_connect():
     return psycopg2.connect(DB_DSN)
 
 
-def fetch_incomplete_records(conn) -> list[dict]:
+def get_table_columns(conn) -> set[str]:
+    """Return the set of column names that actually exist in DB_TABLE."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s",
+            (DB_SCHEMA, DB_TABLE),
+        )
+        cols = {row[0] for row in cur.fetchall()}
+    if not cols:
+        log.error(f"Table {DB_SCHEMA}.{DB_TABLE} not found or has no columns.")
+        sys.exit(1)
+    log.info(f"Table {DB_TABLE} has {len(cols)} columns: {sorted(cols)}")
+    return cols
+
+
+def fetch_incomplete_records(conn, table_cols: set[str]) -> list[dict]:
     """Return all records that have at least one blank backfill field."""
+    # Only filter/select fields that actually exist in this table
+    active_fields = [f for f in BACKFILL_FIELDS if f in table_cols]
+    if not active_fields:
+        log.warning("None of the backfill fields exist in the table.")
+        return []
+
+    # Columns to SELECT: always include id + active backfill fields
+    # Also include subject/email columns if they exist (used for email lookup)
+    subject_col  = next((c for c in ("email_subject", "subject") if c in table_cols), None)
+    email_from   = "email_from"   if "email_from"  in table_cols else None
+    email_to     = "email_to"     if "email_to"    in table_cols else None
+    date_col     = next((c for c in ("date", "created_at", "submission_date") if c in table_cols), None)
+
+    select_cols = ["id"] + active_fields
+    for c in [subject_col, email_from, email_to, date_col]:
+        if c and c not in select_cols:
+            select_cols.append(c)
+
     conditions = " OR ".join(
-        f"({f} IS NULL OR TRIM({f}::text) = '')" for f in BACKFILL_FIELDS
+        f"({f} IS NULL OR TRIM({f}::text) = '')" for f in active_fields
     )
-    sql = f"""
-        SELECT id, email_subject, email_from, email_to, date,
-               name_of_candidate, contact_number, email_id,
-               jr_no, general_skill, total_experience, relevant_experience,
-               current_ctc, expected_ctc, notice_period, current_org,
-               current_location, preferred_location, remarks
-        FROM {DB_SCHEMA}.{DB_TABLE}
-        WHERE {conditions}
-        ORDER BY date DESC, email_subject
-    """
+    order = f"ORDER BY {date_col} DESC" if date_col else "ORDER BY id DESC"
+    sql = (
+        f"SELECT {', '.join(select_cols)} "
+        f"FROM {DB_SCHEMA}.{DB_TABLE} "
+        f"WHERE {conditions} {order}"
+    )
     with conn.cursor() as cur:
         cur.execute(sql)
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    log.info(f"Found {len(rows)} incomplete record(s). Active backfill fields: {active_fields}")
+    return rows
 
 
 def update_record(conn, record_id: int, updates: dict) -> None:
@@ -210,8 +243,12 @@ def run(do_update: bool = False) -> None:
     log.info("=== Backfill starting ===")
 
     conn = db_connect()
-    incomplete = fetch_incomplete_records(conn)
-    log.info(f"Found {len(incomplete)} record(s) with missing fields.")
+
+    # Discover actual columns so we never assume a column exists
+    table_cols = get_table_columns(conn)
+    subject_col = next((c for c in ("email_subject", "subject") if c in table_cols), None)
+
+    incomplete = fetch_incomplete_records(conn, table_cols)
 
     if not incomplete:
         print("Nothing to backfill.")
@@ -221,10 +258,10 @@ def run(do_update: bool = False) -> None:
     mail_token = get_mail_token()
     log.info("Mail token obtained.")
 
-    # Group DB records by email_subject so we fetch each email once
+    # Group DB records by subject so we fetch each email once
     by_subject: dict[str, list[dict]] = {}
     for rec in incomplete:
-        subj = (rec.get("email_subject") or "").strip()
+        subj = (rec.get(subject_col) or "" if subject_col else "").strip()
         by_subject.setdefault(subj, []).append(rec)
 
     preview_rows: list[dict] = []
@@ -232,7 +269,7 @@ def run(do_update: bool = False) -> None:
 
     for subject, db_records in by_subject.items():
         if not subject:
-            log.warning("Skipping record(s) with no email_subject.")
+            log.warning("Skipping record(s) with no subject column value.")
             continue
 
         log.info(f"Searching email: {subject!r}")
