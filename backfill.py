@@ -143,21 +143,31 @@ def update_record(conn, record_id: int, updates: dict) -> None:
 
 # ── Email fetching ────────────────────────────────────────────────────────────
 
-def search_email_by_subject(token: str, subject: str) -> list[dict]:
-    """Search mailbox for messages matching this subject."""
-    encoded = subject.replace("'", "''")
+def search_emails_by_sender_and_date(token: str, sender: str, record_date: date) -> list[dict]:
+    """
+    Fetch emails sent FROM `sender` received within ±1 day of `record_date`.
+    Used when the table has no email_subject column.
+    """
+    from datetime import timedelta
+    date_from = (record_date - timedelta(days=1)).isoformat() + "T00:00:00Z"
+    date_to   = (record_date + timedelta(days=1)).isoformat() + "T23:59:59Z"
+    sender_esc = sender.replace("'", "''")
     url = (
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages"
-        f"?$filter=subject eq '{encoded}'"
+        f"?$filter=from/emailAddress/address eq '{sender_esc}'"
+        f" and receivedDateTime ge {date_from}"
+        f" and receivedDateTime le {date_to}"
         f"&$select=id,subject,from,toRecipients,body,receivedDateTime,hasAttachments,conversationId"
-        f"&$top=5"
+        f"&$top=20"
     )
     try:
         resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
         resp.raise_for_status()
-        return resp.json().get("value", [])
+        msgs = resp.json().get("value", [])
+        log.info(f"  Found {len(msgs)} email(s) from {sender!r} around {record_date}")
+        return msgs
     except Exception as exc:
-        log.warning(f"Subject search failed for {subject!r}: {exc}")
+        log.warning(f"Sender+date search failed ({sender!r}, {record_date}): {exc}")
         return []
 
 
@@ -258,52 +268,62 @@ def run(do_update: bool = False) -> None:
     mail_token = get_mail_token()
     log.info("Mail token obtained.")
 
-    # Group DB records by subject so we fetch each email once
-    by_subject: dict[str, list[dict]] = {}
+    # Group by (email_from, date) — works even when there is no subject column
+    GroupKey = tuple  # (sender, date_str)
+    by_sender_date: dict[GroupKey, list[dict]] = {}
+    skipped_no_key = 0
     for rec in incomplete:
-        subj = (rec.get(subject_col) or "" if subject_col else "").strip()
-        by_subject.setdefault(subj, []).append(rec)
+        sender    = (rec.get("email_from") or "").strip()
+        rec_date  = rec.get("date")
+        if not sender or not rec_date:
+            skipped_no_key += 1
+            continue
+        date_str = rec_date.isoformat() if hasattr(rec_date, "isoformat") else str(rec_date)[:10]
+        by_sender_date.setdefault((sender, date_str), []).append(rec)
+
+    if skipped_no_key:
+        log.warning(f"Skipped {skipped_no_key} record(s) with no email_from or date.")
 
     preview_rows: list[dict] = []
     update_plan:  list[tuple[int, dict]] = []
 
-    for subject, db_records in by_subject.items():
-        if not subject:
-            log.warning("Skipping record(s) with no subject column value.")
-            continue
+    # Cache extracted rows per (sender, date) so each mailbox query runs once
+    extracted_cache: dict[GroupKey, list[dict]] = {}
 
-        log.info(f"Searching email: {subject!r}")
-        emails = search_email_by_subject(mail_token, subject)
+    for (sender, date_str), db_records in by_sender_date.items():
+        log.info(f"Processing {len(db_records)} record(s) — sender={sender!r} date={date_str}")
 
-        if not emails:
-            log.warning(f"  Email not found in mailbox: {subject!r}")
-            continue
+        if (sender, date_str) not in extracted_cache:
+            record_date = date.fromisoformat(date_str)
+            emails = search_emails_by_sender_and_date(mail_token, sender, record_date)
 
-        # Collect all extracted rows from the full thread
-        all_extracted: list[dict] = []
-        seen_conv: set[str] = set()
-        for msg in emails:
-            conv_id = msg.get("conversationId", "")
-            if conv_id and conv_id not in seen_conv:
-                seen_conv.add(conv_id)
-                thread_msgs = fetch_thread_messages(mail_token, conv_id)
-            else:
-                thread_msgs = [msg]
+            all_extracted: list[dict] = []
+            seen_conv: set[str] = set()
+            for msg in emails:
+                conv_id = msg.get("conversationId", "")
+                if conv_id and conv_id not in seen_conv:
+                    seen_conv.add(conv_id)
+                    thread_msgs = fetch_thread_messages(mail_token, conv_id)
+                else:
+                    thread_msgs = [msg]
 
-            for thread_msg in thread_msgs:
-                body_html = (thread_msg.get("body") or {}).get("content", "")
-                rows, headers_ok = parse_html_table(body_html)
-                if rows and headers_ok:
-                    all_extracted.extend(rows)
-                elif AI_PROVIDER != "none":
-                    ai_rows = ai_extract(body_html)
-                    all_extracted.extend(ai_rows)
+                for thread_msg in thread_msgs:
+                    body_html = (thread_msg.get("body") or {}).get("content", "")
+                    rows, headers_ok = parse_html_table(body_html)
+                    if rows and headers_ok:
+                        all_extracted.extend(rows)
+                    elif AI_PROVIDER != "none":
+                        ai_rows = ai_extract(body_html)
+                        all_extracted.extend(ai_rows)
+
+            extracted_cache[(sender, date_str)] = all_extracted
+            log.info(f"  Extracted {len(all_extracted)} row(s) total from these emails.")
+
+        all_extracted = extracted_cache[(sender, date_str)]
 
         if not all_extracted:
-            log.warning(f"  No rows extracted from email: {subject!r}")
+            log.warning(f"  No rows extracted for sender={sender!r} date={date_str}")
             continue
-
-        log.info(f"  Extracted {len(all_extracted)} row(s) from email.")
 
         for db_rec in db_records:
             matched = best_match(db_rec, all_extracted)
@@ -319,7 +339,7 @@ def run(do_update: bool = False) -> None:
             preview_rows.append({
                 "id":      db_rec["id"],
                 "name":    db_rec.get("name_of_candidate") or "(unknown)",
-                "subject": subject,
+                "subject": f"{sender} / {date_str}",
                 "updates": updates,
             })
             update_plan.append((db_rec["id"], updates))
