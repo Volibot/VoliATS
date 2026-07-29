@@ -114,7 +114,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "contact_number": [
         "contact number", "contact_number", "phone", "mobile", "cell",
         "phone number", "phone_number", "mobile number", "mobile_number",
-        "contact no", "contact_no", "ph no", "ph_no", "contact",
+        "contact no", "contact_no", "ph no", "ph_no", "contact", "Contact No."
     ],
     "email_id": [
         "email id", "email_id", "email", "e-mail", "mail id", "mail_id",

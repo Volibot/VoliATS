@@ -174,9 +174,9 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "contact_number": [
         "contact number", "contact_number", "phone", "mobile", "cell",
         "phone number", "phone_number", "mobile number", "mobile_number",
-        "contact no", "contact_no", "ph no", "ph_no", "contact",
-        "mobile no.", "contact details", "contact detail",
-        "mob no", "mob", "phone no",
+        "contact no", "contact no.", "contact_no", "ph no", "ph_no", "contact",
+        "mobile no.", "mobile no", "contact details", "contact detail",
+        "mob no", "mob", "phone no", "contact no (mobile)",
     ],
     "email_id": [
         "email id", "email_id", "email", "e-mail", "mail id", "mail_id",
@@ -245,25 +245,225 @@ COLUMN_ALIASES: dict[str, list[str]] = {
 def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
+def _strip_punct(s: str) -> str:
+    """Remove punctuation and collapse spaces — used for loose matching."""
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s)).strip()
+
 ALIAS_MAP: dict[str, str] = {
     _normalize(alias): canonical
     for canonical, aliases in COLUMN_ALIASES.items()
     for alias in aliases
 }
 
+# Secondary map with all punctuation stripped — handles "Contact No." → "contact no"
+ALIAS_MAP_LOOSE: dict[str, str] = {}
+for _alias_key, _canonical in ALIAS_MAP.items():
+    _stripped = _strip_punct(_alias_key)
+    if _stripped and _stripped not in ALIAS_MAP_LOOSE:
+        ALIAS_MAP_LOOSE[_stripped] = _canonical
+
+# ── Keyword-based fallback (no alias list needed) ─────────────────────────────
+# Expands abbreviations so "Contact No." → {"contact", "number"} before scoring.
+ABBREV_EXPAND: dict[str, str] = {
+    "no":   "number",  "no.": "number",
+    "mob":  "mobile",  "ph":  "phone",
+    "exp":  "experience", "exps": "experience",
+    "rel":  "relevant",
+    "tot":  "total",
+    "curr": "current", "cur": "current",
+    "pref": "preferred",
+    "loc":  "location",
+    "cand": "candidate",
+    "org":  "organisation",
+    "yr":   "year",    "yrs": "years",
+    "ctc":  "ctc",
+}
+
+# Key words that uniquely (or strongly) identify each field.
+# Words shared across many fields (e.g. "current") score less but still count.
+FIELD_KEYWORDS: dict[str, set[str]] = {
+    "name_of_candidate":   {"name", "candidate"},
+    "contact_number":      {"contact", "number", "mobile", "phone"},
+    "email_id":            {"email", "mail"},
+    "total_experience":    {"total", "experience"},
+    "relevant_experience": {"relevant", "experience"},
+    "current_ctc":         {"current", "ctc"},
+    "expected_ctc":        {"expected", "ctc"},
+    "notice_period":       {"notice", "period"},
+    "current_org":         {"current", "organisation", "company", "employer"},
+    "current_location":    {"current", "location", "city"},
+    "preferred_location":  {"preferred", "location"},
+    "general_skill":       {"skill", "skills", "technology", "requirement"},
+    "jr_no":               {"jr", "requisition"},
+    "date":                {"date", "submission"},
+    "remarks":             {"remarks", "comments", "notes", "availability"},
+}
+
+def _keyword_score(header_words: set[str], field: str) -> int:
+    """Count how many expanded header words hit this field's keyword set."""
+    return len(header_words & FIELD_KEYWORDS[field])
+
+def _resolve_by_keywords(raw: str) -> Optional[str]:
+    """
+    Expand abbreviations in the header, then score against FIELD_KEYWORDS.
+    Returns the best-scoring field if it scores ≥ 2, or ≥ 1 for fields with
+    a highly distinctive keyword (ctc, email, notice, relevant).
+    """
+    words = _strip_punct(_normalize(raw)).split()
+    expanded = {ABBREV_EXPAND.get(w, w) for w in words}
+
+    scores: dict[str, int] = {
+        field: _keyword_score(expanded, field)
+        for field in FIELD_KEYWORDS
+    }
+    best_field = max(scores, key=lambda f: scores[f])
+    best_score = scores[best_field]
+
+    if best_score == 0:
+        return None
+
+    # Single-score match is only accepted when a distinctive keyword is hit
+    distinctive = {"ctc", "email", "mail", "notice", "relevant", "candidate",
+                   "requisition", "submission", "remarks", "preferred"}
+    if best_score == 1 and not (expanded & distinctive):
+        return None
+
+    # Reject if two fields tie — too ambiguous
+    tied = [f for f, s in scores.items() if s == best_score]
+    if len(tied) > 1:
+        return None
+
+    return best_field
+
+
 def _resolve_header(raw: str) -> Optional[str]:
     key = _normalize(raw)
+
+    # 1. Exact match
     if key in ALIAS_MAP:
         return ALIAS_MAP[key]
-    # Fuzzy match using rapidfuzz if installed
+
+    # 2. Punctuation-stripped exact match ("Contact No." → "contact no")
+    key_loose = _strip_punct(key)
+    if key_loose in ALIAS_MAP_LOOSE:
+        return ALIAS_MAP_LOOSE[key_loose]
+
+    # 3. Word-token partial match: all words of the alias appear in the header
+    key_words = set(key_loose.split())
+    best_match: Optional[str] = None
+    best_word_count = 0
+    for alias_loose, canonical in ALIAS_MAP_LOOSE.items():
+        alias_words = set(alias_loose.split())
+        if len(alias_words) >= 2 and alias_words.issubset(key_words):
+            if len(alias_words) > best_word_count:
+                best_match = canonical
+                best_word_count = len(alias_words)
+        elif len(alias_words) == 1 and alias_words.issubset(key_words):
+            word = next(iter(alias_words))
+            if len(word) >= 6 and best_word_count == 0:
+                best_match = canonical
+    if best_match:
+        return best_match
+
+    # 4. Abbreviation-expansion + keyword overlap (works without any alias entry)
+    kw_match = _resolve_by_keywords(raw)
+    if kw_match:
+        log.debug(f"  Header {raw!r} resolved via keyword expansion → {kw_match!r}")
+        return kw_match
+
+    # 5. Fuzzy match using rapidfuzz if installed
     try:
         from rapidfuzz import process, fuzz
         best = process.extractOne(key, ALIAS_MAP.keys(), scorer=fuzz.token_sort_ratio)
-        if best and best[1] >= 75:
+        if best and best[1] >= 70:
             return ALIAS_MAP[best[0]]
     except ImportError:
         pass
     return None
+
+
+# ── AI header mapping ─────────────────────────────────────────────────────────
+_HEADER_MAP_CACHE: dict[str, Optional[str]] = {}
+
+_HEADER_MAP_PROMPT = """\
+You are mapping spreadsheet column headers to canonical database field names for a candidate profile system.
+
+Canonical fields (pick one per header, or null if none fits):
+  name_of_candidate   – candidate full name
+  contact_number      – phone / mobile number
+  email_id            – email address
+  total_experience    – total years of work experience
+  relevant_experience – domain/relevant experience
+  current_ctc         – current salary / CTC
+  expected_ctc        – expected / desired salary / CTC
+  notice_period       – notice period / joining availability
+  current_org         – current employer / company
+  current_location    – current city or location
+  preferred_location  – preferred work location
+  general_skill       – skill / technology / job requirement
+  jr_no               – job requisition number
+  date                – date of profile submission
+  remarks             – comments / notes / additional info
+
+Headers to map: {headers_json}
+
+Return ONLY valid JSON — an object mapping each header string to a canonical field name or null.
+Example: {{"Contact No.": "contact_number", "S.No": null}}
+"""
+
+def _ai_map_headers(unknown_headers: list[str]) -> dict[str, Optional[str]]:
+    """
+    Send unrecognised column headers to Gemini and get back a mapping dict.
+    Cache key is the lowercased header so "CONTACT NO." and "Contact No." share
+    the same cache entry.  Results are cached so the same header (in any case)
+    is never sent to the API twice per run.
+    """
+    if AI_PROVIDER == "none" or not GEMINI_API_KEY:
+        return {}
+
+    # Normalise to lowercase for cache lookups; keep a de-duplicated list to send
+    norm_keys = {h: _normalize(h) for h in unknown_headers}
+    to_ask_norm: list[str] = []
+    seen: set[str] = set()
+    for norm in norm_keys.values():
+        if norm not in _HEADER_MAP_CACHE and norm not in seen:
+            to_ask_norm.append(norm)
+            seen.add(norm)
+
+    if to_ask_norm:
+        prompt = _HEADER_MAP_PROMPT.format(
+            headers_json=json.dumps(to_ask_norm, ensure_ascii=False)
+        )
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-flash-lite-latest:generateContent?key={GEMINI_API_KEY}"
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 512},
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=20)
+            resp.raise_for_status()
+            raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            raw_text = re.sub(r"```(?:json)?", "", raw_text).strip().strip("`").strip()
+            mapping: dict = json.loads(raw_text)
+            valid_fields = set(FIELD_KEYWORDS.keys())
+            for h, field in mapping.items():
+                # Gemini echoes back our normalised keys; store by normalised key
+                norm_h = _normalize(h)
+                resolved = field if (isinstance(field, str) and field in valid_fields) else None
+                _HEADER_MAP_CACHE[norm_h] = resolved
+                if resolved:
+                    log.info(f"  [AI header map] {h!r} → {resolved!r}")
+                else:
+                    log.debug(f"  [AI header map] {h!r} → unmapped (null)")
+        except Exception as exc:
+            log.warning(f"AI header mapping failed: {exc}")
+            for norm in to_ask_norm:
+                _HEADER_MAP_CACHE[norm] = None
+
+    return {h: _HEADER_MAP_CACHE.get(norm_keys[h]) for h in unknown_headers}
 
 
 # ── AI Extraction ──────────────────────────────────────────────────────────────
@@ -295,7 +495,7 @@ def _ai_extract_gemini(body_text: str) -> list[dict]:
     prompt = AI_EXTRACTION_PROMPT.format(body=body_text[:8000])
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        f"gemini-flash-lite-latest:generateContent?key={GEMINI_API_KEY}"
     )
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -704,7 +904,24 @@ def parse_html_table(html: str) -> tuple[list[dict], bool]:
         any_table_found = True
         raw_headers = re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", all_rows[0], re.DOTALL | re.IGNORECASE)
         headers = [_clean_cell(h) for h in raw_headers]
-        col_map = {i: _resolve_header(h) for i, h in enumerate(headers) if _resolve_header(h)}
+
+        # Build col_map: first pass with rule-based resolver
+        col_map: dict[int, str] = {}
+        unresolved: dict[int, str] = {}
+        for i, h in enumerate(headers):
+            result = _resolve_header(h)
+            if result:
+                col_map[i] = result
+            elif h.strip():
+                unresolved[i] = h
+
+        # Second pass: send unresolved headers to AI in one batch
+        if unresolved:
+            ai_mapping = _ai_map_headers(list(unresolved.values()))
+            for i, h in unresolved.items():
+                field = ai_mapping.get(h)
+                if field:
+                    col_map[i] = field
 
         if not _headers_make_sense(col_map):
             log.info(f"  Table found but headers not sensible ({headers[:5]}) — will try AI.")
