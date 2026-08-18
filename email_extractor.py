@@ -1494,7 +1494,7 @@ def process_emails() -> None:
                         "delivery_type":       delivery_type,
                         "company_name":        company_name,
                         "attachment":          _t(candidate_attachment) or None,
-                        "is_duplicate":        dup_label,
+                        "is_duplicate":        None,
                         "created_by":          _t(from_addr),
                         "created_date":        now,
                         "modified_by":         _t(from_addr),
@@ -1517,11 +1517,18 @@ def process_emails() -> None:
                     if ok:
                         inserted += 1
                         email_inserted += 1
+                        # Mark the old record as superseded so the new one is active
+                        cur.execute(
+                            pgsql.SQL(
+                                "UPDATE {table} SET is_duplicate = %s, modified_date = NOW() WHERE id = %s"
+                            ).format(table=pgsql.Identifier(DB_TABLE)),
+                            (dup_label, same_rec["id"]),
+                        )
                         log.info(
                             f"  ✓ [{dup_label}] Inserted {candidate_name or '(unknown)'} "
                             f"recruiter={recruiter} | new_client={client_recruiter} "
                             f"| prev_client={same_rec.get('client_recruiter')} "
-                            f"| same_job={same_job}"
+                            f"| same_job={same_job} | old_id={same_rec['id']} marked as {dup_label}"
                         )
                     else:
                         errors += 1
