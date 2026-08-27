@@ -1,9 +1,9 @@
 """
 Backfill missing columns for already-processed emails
 ══════════════════════════════════════════════════════
-Finds records in temp_hrvolibit_archive that have blank fields,
-re-fetches those emails from the mailbox, re-parses the table,
-and fills in only the missing values — never overwrites existing data.
+Pulls every message_id from hr_processed_emails, fetches the email body
+directly from the mailbox, re-parses the candidate table, and fills in
+only the blank fields in hrvolibit — never overwrites existing data.
 
 Usage:
     python backfill.py            # preview what would be updated
@@ -45,8 +45,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DB_DSN    = os.environ.get("DB_DSN") or os.environ.get("DATABASE_URL")
-DB_TABLE  = "hrvolibit"
+DB_DSN   = os.environ.get("DB_DSN") or os.environ.get("DATABASE_URL")
+DB_TABLE = "hrvolibit"
+TRACKING_TABLE = "hr_processed_emails"
 
 # Fields that can be backfilled from the email table
 BACKFILL_FIELDS = [
@@ -88,27 +89,35 @@ def get_table_columns(conn) -> set[str]:
     if not cols:
         log.error(f"Table {DB_SCHEMA}.{DB_TABLE} not found or has no columns.")
         sys.exit(1)
-    log.info(f"Table {DB_TABLE} has {len(cols)} columns: {sorted(cols)}")
+    log.info(f"Table {DB_TABLE} has {len(cols)} columns.")
     return cols
 
 
+def fetch_processed_emails(conn) -> list[dict]:
+    """Return all rows from hr_processed_emails (message_id + from_addr + subject)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT message_id, from_addr, subject, processed_at "
+            f"FROM {TRACKING_TABLE} ORDER BY processed_at ASC"
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    log.info(f"Found {len(rows)} processed email(s) in {TRACKING_TABLE}.")
+    return rows
+
+
 def fetch_incomplete_records(conn, table_cols: set[str]) -> list[dict]:
-    """Return all records that have at least one blank backfill field."""
-    # Only filter/select fields that actually exist in this table
+    """Return all hrvolibit records that have at least one blank backfill field."""
     active_fields = [f for f in BACKFILL_FIELDS if f in table_cols]
     if not active_fields:
         log.warning("None of the backfill fields exist in the table.")
         return []
 
-    # Columns to SELECT: always include id + active backfill fields
-    # Also include subject/email columns if they exist (used for email lookup)
-    subject_col  = next((c for c in ("email_subject", "subject") if c in table_cols), None)
-    email_from   = "email_from"   if "email_from"  in table_cols else None
-    email_to     = "email_to"     if "email_to"    in table_cols else None
-    date_col     = next((c for c in ("date", "created_at", "submission_date") if c in table_cols), None)
+    email_from_col = "email_from" if "email_from" in table_cols else None
+    date_col = next((c for c in ("date", "created_at", "submission_date") if c in table_cols), None)
 
     select_cols = ["id"] + active_fields
-    for c in [subject_col, email_from, email_to, date_col]:
+    for c in [email_from_col, date_col]:
         if c and c not in select_cols:
             select_cols.append(c)
 
@@ -126,7 +135,7 @@ def fetch_incomplete_records(conn, table_cols: set[str]) -> list[dict]:
         cols = [d[0] for d in cur.description]
         rows = [dict(zip(cols, row)) for row in cur.fetchall()]
 
-    log.info(f"Found {len(rows)} incomplete record(s). Active backfill fields: {active_fields}")
+    log.info(f"Found {len(rows)} incomplete record(s) in {DB_TABLE}.")
     return rows
 
 
@@ -143,32 +152,23 @@ def update_record(conn, record_id: int, updates: dict) -> None:
 
 # ── Email fetching ────────────────────────────────────────────────────────────
 
-def search_emails_by_sender_and_date(token: str, sender: str, record_date: date) -> list[dict]:
-    """
-    Fetch emails sent FROM `sender` received within ±1 day of `record_date`.
-    Used when the table has no email_subject column.
-    """
-    from datetime import timedelta
-    date_from = (record_date - timedelta(days=1)).isoformat() + "T00:00:00Z"
-    date_to   = (record_date + timedelta(days=1)).isoformat() + "T23:59:59Z"
-    sender_esc = sender.replace("'", "''")
+def fetch_message_by_id(token: str, message_id: str) -> Optional[dict]:
+    """Fetch a single email directly by its Graph API message_id."""
     url = (
-        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages"
-        f"?$filter=from/emailAddress/address eq '{sender_esc}'"
-        f" and receivedDateTime ge {date_from}"
-        f" and receivedDateTime le {date_to}"
-        f"&$select=id,subject,from,toRecipients,body,receivedDateTime,hasAttachments,conversationId"
-        f"&$top=20"
+        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
+        f"/messages/{message_id}"
+        f"?$select=id,subject,from,toRecipients,body,receivedDateTime,hasAttachments,conversationId"
     )
     try:
         resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        if resp.status_code == 404:
+            log.warning(f"  Message {message_id!r} not found (deleted/moved).")
+            return None
         resp.raise_for_status()
-        msgs = resp.json().get("value", [])
-        log.info(f"  Found {len(msgs)} email(s) from {sender!r} around {record_date}")
-        return msgs
+        return resp.json()
     except Exception as exc:
-        log.warning(f"Sender+date search failed ({sender!r}, {record_date}): {exc}")
-        return []
+        log.warning(f"  Failed to fetch message {message_id!r}: {exc}")
+        return None
 
 
 # ── Match extracted row to DB record ─────────────────────────────────────────
@@ -180,10 +180,7 @@ def _norm(v) -> str:
 def best_match(db_record: dict, extracted_rows: list[dict]) -> Optional[dict]:
     """
     Find the extracted row that best matches the DB record.
-    Match priority:
-      1. email exact match
-      2. phone exact match
-      3. name exact match (case-insensitive)
+    Priority: email match → phone match → name match (case-insensitive).
     """
     for row in extracted_rows:
         if _norm(row.get("email_id")) and _norm(row.get("email_id")) == _norm(db_record.get("email_id")):
@@ -201,9 +198,8 @@ def best_match(db_record: dict, extracted_rows: list[dict]) -> Optional[dict]:
 
 def compute_updates(db_record: dict, extracted: dict) -> dict:
     """
-    Return a dict of {field: new_value} for fields that are currently blank
-    in the DB record but have a value in the extracted row.
-    Never overwrites an existing value.
+    Return {field: new_value} for fields currently blank in DB but present
+    in the extracted row. Never overwrites an existing value.
     """
     updates = {}
     field_map = {
@@ -254,78 +250,82 @@ def run(do_update: bool = False) -> None:
 
     conn = db_connect()
 
-    # Discover actual columns so we never assume a column exists
-    table_cols = get_table_columns(conn)
-    subject_col = next((c for c in ("email_subject", "subject") if c in table_cols), None)
-
-    incomplete = fetch_incomplete_records(conn, table_cols)
+    table_cols   = get_table_columns(conn)
+    incomplete   = fetch_incomplete_records(conn, table_cols)
 
     if not incomplete:
         print("Nothing to backfill.")
         conn.close()
         return
 
+    # Build a quick lookup: email_from → [db_records] for matching later
+    by_sender: dict[str, list[dict]] = {}
+    for rec in incomplete:
+        sender = (rec.get("email_from") or "").strip().lower()
+        if sender:
+            by_sender.setdefault(sender, []).append(rec)
+
+    # Also keep all incomplete records in a flat list for name/phone matching
+    all_incomplete = incomplete
+
+    processed_emails = fetch_processed_emails(conn)
+
+    if not processed_emails:
+        print(f"No rows in {TRACKING_TABLE}.")
+        conn.close()
+        return
+
     mail_token = get_mail_token()
     log.info("Mail token obtained.")
-
-    # Group by (email_from, date) — works even when there is no subject column
-    GroupKey = tuple  # (sender, date_str)
-    by_sender_date: dict[GroupKey, list[dict]] = {}
-    skipped_no_key = 0
-    for rec in incomplete:
-        sender    = (rec.get("email_from") or "").strip()
-        rec_date  = rec.get("date")
-        if not sender or not rec_date:
-            skipped_no_key += 1
-            continue
-        date_str = rec_date.isoformat() if hasattr(rec_date, "isoformat") else str(rec_date)[:10]
-        by_sender_date.setdefault((sender, date_str), []).append(rec)
-
-    if skipped_no_key:
-        log.warning(f"Skipped {skipped_no_key} record(s) with no email_from or date.")
 
     preview_rows: list[dict] = []
     update_plan:  list[tuple[int, dict]] = []
 
-    # Cache extracted rows per (sender, date) so each mailbox query runs once
-    extracted_cache: dict[GroupKey, list[dict]] = {}
+    # Cache extracted rows per message_id so each fetch runs once
+    extracted_cache: dict[str, list[dict]] = {}
 
-    for (sender, date_str), db_records in by_sender_date.items():
-        log.info(f"Processing {len(db_records)} record(s) — sender={sender!r} date={date_str}")
+    for email_row in processed_emails:
+        message_id = email_row["message_id"]
+        from_addr  = (email_row.get("from_addr") or "").strip().lower()
+        subject    = email_row.get("subject") or ""
 
-        if (sender, date_str) not in extracted_cache:
-            record_date = date.fromisoformat(date_str)
-            emails = search_emails_by_sender_and_date(mail_token, sender, record_date)
+        log.info(f"Processing message_id={message_id!r} from={from_addr!r}")
+
+        if message_id not in extracted_cache:
+            msg = fetch_message_by_id(mail_token, message_id)
+            if not msg:
+                extracted_cache[message_id] = []
+                continue
+
+            # Also fetch the full thread in case the table is in a reply
+            conv_id = msg.get("conversationId", "")
+            thread_msgs = fetch_thread_messages(mail_token, conv_id) if conv_id else [msg]
 
             all_extracted: list[dict] = []
-            seen_conv: set[str] = set()
-            for msg in emails:
-                conv_id = msg.get("conversationId", "")
-                if conv_id and conv_id not in seen_conv:
-                    seen_conv.add(conv_id)
-                    thread_msgs = fetch_thread_messages(mail_token, conv_id)
-                else:
-                    thread_msgs = [msg]
+            for thread_msg in thread_msgs:
+                body_html = (thread_msg.get("body") or {}).get("content", "")
+                rows, headers_ok = parse_html_table(body_html)
+                if rows and headers_ok:
+                    all_extracted.extend(rows)
+                elif AI_PROVIDER != "none":
+                    ai_rows = ai_extract(body_html)
+                    all_extracted.extend(ai_rows)
 
-                for thread_msg in thread_msgs:
-                    body_html = (thread_msg.get("body") or {}).get("content", "")
-                    rows, headers_ok = parse_html_table(body_html)
-                    if rows and headers_ok:
-                        all_extracted.extend(rows)
-                    elif AI_PROVIDER != "none":
-                        ai_rows = ai_extract(body_html)
-                        all_extracted.extend(ai_rows)
+            extracted_cache[message_id] = all_extracted
+            log.info(f"  Extracted {len(all_extracted)} row(s) from this message/thread.")
 
-            extracted_cache[(sender, date_str)] = all_extracted
-            log.info(f"  Extracted {len(all_extracted)} row(s) total from these emails.")
-
-        all_extracted = extracted_cache[(sender, date_str)]
-
+        all_extracted = extracted_cache[message_id]
         if not all_extracted:
-            log.warning(f"  No rows extracted for sender={sender!r} date={date_str}")
+            log.warning(f"  No rows extracted for {message_id!r}")
             continue
 
-        for db_rec in db_records:
+        # Find incomplete hrvolibit records that came from this sender
+        candidates = by_sender.get(from_addr, [])
+        if not candidates:
+            log.info(f"  No incomplete records for sender {from_addr!r}, skipping.")
+            continue
+
+        for db_rec in candidates:
             matched = best_match(db_rec, all_extracted)
             if not matched:
                 log.info(f"  No match for ID {db_rec['id']} ({db_rec.get('name_of_candidate')!r})")
@@ -339,7 +339,7 @@ def run(do_update: bool = False) -> None:
             preview_rows.append({
                 "id":      db_rec["id"],
                 "name":    db_rec.get("name_of_candidate") or "(unknown)",
-                "subject": f"{sender} / {date_str}",
+                "subject": subject or from_addr,
                 "updates": updates,
             })
             update_plan.append((db_rec["id"], updates))
