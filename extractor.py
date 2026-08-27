@@ -346,6 +346,12 @@ def _resolve_header(raw: str) -> Optional[str]:
     if key in ALIAS_MAP:
         return ALIAS_MAP[key]
 
+    # 1a. JR No pattern: header contains "jr" token + any of "no/number/num/#"
+    #     Works regardless of case, separator (space, -, _, <br>→space, parens)
+    _tokens = set(re.split(r"[\s\-_/.,;:!?()#]+", key)) - {""}
+    if "jr" in _tokens and (_tokens & {"no", "number", "num", "#"}):
+        return "jr_no"
+
     # 2. Punctuation-stripped exact match ("Contact No." → "contact no")
     key_loose = _strip_punct(key)
     if key_loose in ALIAS_MAP_LOOSE:
