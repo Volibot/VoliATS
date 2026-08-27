@@ -258,15 +258,21 @@ def run(do_update: bool = False) -> None:
         conn.close()
         return
 
-    # Build a quick lookup: email_from → [db_records] for matching later
-    by_sender: dict[str, list[dict]] = {}
+    # Build lookup: (email_from, date) → [db_records]
+    # date is stored as a date object in hrvolibit; we index all dates ±1 day
+    # so slight offsets between processed_at and the table's date column don't matter
+    from datetime import timedelta
+    by_sender_date: dict[tuple, list[dict]] = {}
+    date_col = next((c for c in ("date", "created_at", "submission_date") if c in table_cols), None)
     for rec in incomplete:
         sender = (rec.get("email_from") or "").strip().lower()
-        if sender:
-            by_sender.setdefault(sender, []).append(rec)
-
-    # Also keep all incomplete records in a flat list for name/phone matching
-    all_incomplete = incomplete
+        rec_date = rec.get(date_col) if date_col else None
+        if not sender or not rec_date:
+            continue
+        d = rec_date if isinstance(rec_date, date) else date.fromisoformat(str(rec_date)[:10])
+        for delta in (-1, 0, 1):
+            key = (sender, d + timedelta(days=delta))
+            by_sender_date.setdefault(key, []).append(rec)
 
     processed_emails = fetch_processed_emails(conn)
 
@@ -319,11 +325,20 @@ def run(do_update: bool = False) -> None:
             log.warning(f"  No rows extracted for {message_id!r}")
             continue
 
-        # Find incomplete hrvolibit records that came from this sender
-        candidates = by_sender.get(from_addr, [])
+        # Find incomplete hrvolibit records matching this sender + processed date
+        proc_date = email_row["processed_at"].date() if hasattr(email_row.get("processed_at"), "date") else date.fromisoformat(str(email_row.get("processed_at", ""))[:10])
+        candidates = by_sender_date.get((from_addr, proc_date), [])
         if not candidates:
-            log.info(f"  No incomplete records for sender {from_addr!r}, skipping.")
+            log.info(f"  No incomplete records for sender={from_addr!r} date={proc_date}, skipping.")
             continue
+        # Deduplicate (same record may appear via ±1 day keys)
+        seen_ids: set[int] = set()
+        unique_candidates = []
+        for c in candidates:
+            if c["id"] not in seen_ids:
+                seen_ids.add(c["id"])
+                unique_candidates.append(c)
+        candidates = unique_candidates
 
         for db_rec in candidates:
             matched = best_match(db_rec, all_extracted)
