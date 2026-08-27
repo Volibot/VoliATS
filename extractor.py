@@ -165,6 +165,8 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "requirement id", "requirement_id", "jrno.", "jr#", "JRNo.", "JRNo", "JRNO", "jr", "JR",
         "jr no(mention the jr number where profiles are uploaded on sf).",
         "jr no (mention the jr number where profiles are uploaded on sf).",
+        "jrno(mention the jr number where profiles are uploaded on sf).",
+        "jrno (mention the jr number where profiles are uploaded on sf).",
     ],
     "name_of_candidate": [
         "candidate name", "candidate_name", "name", "applicant name",
@@ -843,6 +845,8 @@ def _strip_html(text: str) -> str:
 
 def _clean_cell(text: str) -> str:
     text = html_lib.unescape(text)
+    # Replace <br> variants with a space so "JR<br>No" \u2192 "JR No" not "JRNo"
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
     text = _strip_html(text)
     text = text.replace("\u00a0", " ")
     return re.sub(r"\s+", " ", text).strip()
