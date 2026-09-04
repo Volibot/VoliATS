@@ -109,6 +109,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "jr no(mention the jr number where profiles are uploaded on sf).",
         "jr no (mention the jr number where profiles are uploaded on sf).",
         "jrno(mention the jr number where profiles are uploaded on sf).",
+        "vendor name", "vendor", "vendor no", "vendor_name",
     ],
     "name_of_candidate": [
         "candidate name", "candidate_name", "name", "applicant name",
@@ -477,6 +478,18 @@ def _clean_cell(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_JR_EMBEDDED_RE = re.compile(r"[A-Za-z][A-Za-z0-9\s]*[/\\-](\d{3,8})\s*$")
+
+def _sanitize_jr_no(val: str) -> str:
+    """Extract bare JR number from values like 'Volibits/38674' or 'VB-38674'."""
+    if not val:
+        return val
+    m = _JR_EMBEDDED_RE.match(val.strip())
+    if m:
+        return m.group(1)
+    return val
+
+
 def parse_html_table(html: str) -> list[dict]:
     """
     Parse candidate rows from HTML email tables.
@@ -529,6 +542,8 @@ def parse_html_table(html: str) -> list[dict]:
                 for i, v in enumerate(cleaned)
                 if i in col_map
             }
+            if "jr_no" in record:
+                record["jr_no"] = _sanitize_jr_no(record["jr_no"])
             if record:
                 rows.append(record)
 
