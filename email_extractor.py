@@ -105,6 +105,10 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "requisition id", "requisition_id", "jr_number", "jr number",
         "job req", "job requisition", "job_req", "reqid",
         "requirement id", "requirement_id",
+        "jrno.", "jr#", "JRNo.", "JRNo", "JRNO", "JR", "jr no:",
+        "jr no(mention the jr number where profiles are uploaded on sf).",
+        "jr no (mention the jr number where profiles are uploaded on sf).",
+        "jrno(mention the jr number where profiles are uploaded on sf).",
     ],
     "name_of_candidate": [
         "candidate name", "candidate_name", "name", "applicant name",
@@ -184,7 +188,14 @@ ALIAS_MAP: dict[str, str] = {
 
 
 def _resolve_header(raw_header: str) -> Optional[str]:
-    return ALIAS_MAP.get(_normalize(raw_header))
+    key = _normalize(raw_header)
+    if key in ALIAS_MAP:
+        return ALIAS_MAP[key]
+    # Token pattern: "jr" + any of "no/number/num" as whole tokens (any separator)
+    tokens = set(re.split(r"[\s\-_/.,;:!?()#]+", key)) - {""}
+    if "jr" in tokens and (tokens & {"no", "number", "num"}):
+        return "jr_no"
+    return None
 
 
 # ─── Microsoft Graph authentication ────────────────────────────────────────────
