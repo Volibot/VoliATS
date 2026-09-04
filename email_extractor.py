@@ -416,18 +416,55 @@ _SKILL_FILLER_RE = re.compile(
 
 
 _STRIP_TAGS_RE = re.compile(r"<[^>]+>")
-_BODY_JR_RE    = re.compile(
-    r"\bjr\.?\s*(?:no\.?|num(?:ber)?|#)?\s*[:\-]?\s*(?P<jr>\d{4,6})\b",
+
+# Matches "JR", "JR No", "JR#", "JR Number", "JR_No", "JR-No.", "JR : 38674" etc.
+# Any non-digit chars (up to 15) allowed between "jr" and the number,
+# then 4-6 digit number. Case-insensitive.
+_BODY_JR_RE = re.compile(
+    r"\bjr[^0-9\n]{0,15}?(?P<jr>\d{4,6})\b",
     re.IGNORECASE,
 )
 
+# Recognise a table header cell as a JR No column
+_JR_HEADER_RE = re.compile(r"\bjr\b", re.IGNORECASE)
+
+
 def _scan_body_for_jr_no(body_html: str) -> Optional[str]:
-    """Scan the full email body (HTML stripped) for any JR number mention."""
+    """
+    Scan all tables in the email for a JR number column, then fall back to
+    a free-text scan of the entire body. Handles any casing, separator, or
+    special character between 'JR' and the number.
+    """
+    soup = BeautifulSoup(body_html, "lxml")
+
+    # 1. Check every table — even ones that failed the full candidate-header check
+    for table in soup.find_all("table"):
+        tbody = table.find("tbody", recursive=False)
+        trs   = (tbody or table).find_all("tr", recursive=False)
+        if len(trs) < 2:
+            continue
+        header_cells = trs[0].find_all(["th", "td"], recursive=False)
+        for col_idx, hcell in enumerate(header_cells):
+            htext = hcell.get_text(separator=" ").strip()
+            if _JR_HEADER_RE.search(htext):
+                # Found a JR-looking header — read the value from data rows
+                for data_row in trs[1:]:
+                    dcells = data_row.find_all(["th", "td"], recursive=False)
+                    if col_idx < len(dcells):
+                        val = _clean_cell(dcells[col_idx].get_text(separator=" ").strip())
+                        val = _sanitize_jr_no(val)
+                        if val and re.fullmatch(r"\d{3,8}", val):
+                            log.info(f"  JR no found in table scan: {val!r} (header={htext!r})")
+                            return val
+
+    # 2. Free-text scan of the stripped body
     text = _STRIP_TAGS_RE.sub(" ", body_html)
     text = unescape(text)
     m = _BODY_JR_RE.search(text)
     if m:
+        log.info(f"  JR no found in body text: {m.group('jr')!r}")
         return m.group("jr")
+
     return None
 
 
@@ -1353,8 +1390,6 @@ def process_emails() -> None:
         body_html  = (msg.get("body") or {}).get("content", "")
         rows       = parse_html_table(body_html)
         body_jr_no = _scan_body_for_jr_no(body_html)
-        if body_jr_no:
-            log.info(f"  JR no found in body text: {body_jr_no!r}")
         if not rows:
             log.warning("No table rows found — inserting skeleton record.")
             rows = [{}]
