@@ -415,6 +415,22 @@ _SKILL_FILLER_RE = re.compile(
 )
 
 
+_STRIP_TAGS_RE = re.compile(r"<[^>]+>")
+_BODY_JR_RE    = re.compile(
+    r"\bjr\.?\s*(?:no\.?|num(?:ber)?|#)?\s*[:\-]?\s*(?P<jr>\d{4,6})\b",
+    re.IGNORECASE,
+)
+
+def _scan_body_for_jr_no(body_html: str) -> Optional[str]:
+    """Scan the full email body (HTML stripped) for any JR number mention."""
+    text = _STRIP_TAGS_RE.sub(" ", body_html)
+    text = unescape(text)
+    m = _BODY_JR_RE.search(text)
+    if m:
+        return m.group("jr")
+    return None
+
+
 def _extract_jr_and_skill(rest: str) -> tuple[Optional[str], str]:
     rest = rest.strip()
     jr_no: Optional[str] = None
@@ -1334,8 +1350,11 @@ def process_emails() -> None:
         attachment_map: dict[str, str] = upload_all_attachments(od_token, token, msg)
         claimed: set[str] = set()
 
-        body_html = (msg.get("body") or {}).get("content", "")
-        rows      = parse_html_table(body_html)
+        body_html  = (msg.get("body") or {}).get("content", "")
+        rows       = parse_html_table(body_html)
+        body_jr_no = _scan_body_for_jr_no(body_html)
+        if body_jr_no:
+            log.info(f"  JR no found in body text: {body_jr_no!r}")
         if not rows:
             log.warning("No table rows found — inserting skeleton record.")
             rows = [{}]
@@ -1368,7 +1387,7 @@ def process_emails() -> None:
 
             contact_number  = _t(row.get("contact_number"))
             email_id_val    = _t(row.get("email_id"))
-            effective_jr_no = _t(row.get("jr_no")) or subject_jr_no
+            effective_jr_no = _t(row.get("jr_no")) or subject_jr_no or body_jr_no
             candidate_name  = _t(row.get("name_of_candidate"))
 
             if not candidate_name and not contact_number and not email_id_val:
