@@ -349,7 +349,10 @@ def upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optional
 _FILE_STOPWORDS = {
     "resume", "cv", "profile", "updated", "update", "final", "latest", "new",
     "consultant", "engineer", "developer", "manager", "analyst", "architect",
-    "senior", "junior", "lead", "tech", "india",
+    "senior", "junior", "lead", "tech", "india", "functional", "technical",
+    "integration", "migration", "implementation", "oracle", "salesforce",
+    "workday", "servicenow", "scrum", "agile", "cloud", "data", "full",
+    "stack", "front", "back", "years", "year", "month", "months",
 }
 
 
@@ -398,11 +401,15 @@ def best_resume_for_candidate(
     resume_files: list[dict],
     claimed: set[str],
 ) -> Optional[dict]:
-    """Return the best-matching unclaimed attachment for the candidate, or None."""
+    """
+    Return the best-matching unclaimed attachment for the candidate, or None.
+    Matching uses token overlap between candidate name tokens and filename tokens.
+    CamelCase filenames (e.g. SivaSaiSrinivasGurrala[5y_0m].pdf) are split
+    before tokenising, so token matching covers all realistic filename formats.
+    """
     name = candidate_name or ""
-
-    # Pass 1: token overlap
     best_att, best_score = None, 0
+
     for att in resume_files:
         fname = att["name"]
         if fname in claimed:
@@ -413,20 +420,7 @@ def best_resume_for_candidate(
 
     if best_att and best_score >= 1:
         claimed.add(best_att["name"])
-        return best_att
-
-    # Pass 2: substring fallback
-    best_att, best_score = None, 0
-    for att in resume_files:
-        fname = att["name"]
-        if fname in claimed:
-            continue
-        score = _substr_match_score(name, fname)
-        if score > best_score:
-            best_score, best_att = score, att
-
-    if best_att and best_score >= 1:
-        claimed.add(best_att["name"])
+        log.info(f"  Matched {name!r} → {best_att['name']!r} (score={best_score})")
         return best_att
 
     return None
