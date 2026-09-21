@@ -206,6 +206,26 @@ def list_all_folders(token: str) -> list[dict]:
 
 # ── Email fetching ─────────────────────────────────────────────────────────────
 
+def fetch_message_body(token: str, message_id: str) -> dict:
+    """
+    Fetch the body of a single message.
+    Graph API list responses frequently omit or truncate the body even when
+    it is included in $select, so we fall back to a single-message GET for
+    emails from recruiters whose profiles are in our index.
+    """
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
+        f"/messages/{message_id}?$select=body"
+    )
+    try:
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        resp.raise_for_status()
+        return resp.json().get("body", {})
+    except Exception as exc:
+        log.debug(f"fetch_message_body failed for {message_id}: {exc}")
+        return {}
+
+
 def fetch_emails_from_folder(token: str, folder_id: str, folder_path: str) -> list[dict]:
     """Fetch all emails with attachments from a single folder, paginated."""
     headers = {"Authorization": f"Bearer {token}"}
@@ -694,9 +714,17 @@ def run() -> None:
             subject    = msg.get("subject", "").strip()
             message_id = msg["id"]
 
+            # Body: Graph API list responses often return body empty even when
+            # requested via $select.  Fetch individually for recruiter emails.
+            body = msg.get("body") or {}
+            if not body.get("content") and from_addr in profile_index:
+                body = fetch_message_body(mail_token, message_id)
+                if body.get("content"):
+                    log.debug(f"  Body fetched separately for message {message_id}")
+
             # Primary: find candidates whose email/phone appears in the body
             body_profiles = _profiles_from_body(
-                msg.get("body", {}), email_index, phone_index, matched_profile_ids
+                body, email_index, phone_index, matched_profile_ids
             )
 
             # Fallback: recruiter-based match for profiles not already found via body
