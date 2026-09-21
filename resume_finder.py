@@ -345,32 +345,52 @@ def upload_to_onedrive(od_token: str, filename: str, content: bytes) -> Optional
 
 # ── Name-matching helpers ──────────────────────────────────────────────────────
 
-def _name_tokens(name: str) -> set[str]:
-    stem = os.path.splitext(name)[0]
-    # Strip bracket content like [5y_0m], [10y_0m], [Senior], etc.
+# Non-name filler words that appear in resume filenames
+_FILE_STOPWORDS = {
+    "resume", "cv", "profile", "updated", "update", "final", "latest", "new",
+    "consultant", "engineer", "developer", "manager", "analyst", "architect",
+    "senior", "junior", "lead", "tech", "india",
+}
+
+
+def _candidate_tokens(name: str) -> set[str]:
+    """Tokenise a human name string (keeps tokens >= 2 chars)."""
+    text = re.sub(r"[_\-\.]+", " ", name)
+    text = re.sub(r"\d+", " ", text)
+    return {t.lower() for t in text.split() if len(t) >= 2}
+
+
+def _file_tokens(filename: str) -> set[str]:
+    """
+    Tokenise a resume filename.
+    - Strips bracket annotations like [5y_0m]
+    - Splits CamelCase: SivaSaiSrinivas → Siva Sai Srinivas
+    - Keeps only tokens >= 4 chars so short name parts like 'Sai', 'Roy',
+      'cv' never produce a false match across candidates
+    - Removes common non-name filler words
+    """
+    stem = os.path.splitext(filename)[0]
     stem = re.sub(r"\[.*?\]", " ", stem)
-    # Split CamelCase: insert space before an uppercase letter that follows a lowercase
     stem = re.sub(r"([a-z])([A-Z])", r"\1 \2", stem)
-    # Replace common separators with spaces
     stem = re.sub(r"[_\-\.]+", " ", stem)
-    # Strip digits (years, version numbers, etc.)
     stem = re.sub(r"\d+", " ", stem)
-    return {t.lower() for t in stem.split() if len(t) > 1}
+    return {t.lower() for t in stem.split() if len(t) >= 4} - _FILE_STOPWORDS
 
 
 def _token_match_score(candidate_name: str, filename: str) -> int:
     if not candidate_name or not filename:
         return 0
-    return len(_name_tokens(candidate_name) & _name_tokens(filename))
+    return len(_candidate_tokens(candidate_name) & _file_tokens(filename))
 
 
 def _substr_match_score(candidate_name: str, filename: str) -> int:
+    """Fallback: check if any name token (>= 4 chars) is a substring of the filename stem."""
     stem = os.path.splitext(filename)[0]
     stem = re.sub(r"\[.*?\]", " ", stem)
     stem = re.sub(r"([a-z])([A-Z])", r"\1 \2", stem)
-    stem = re.sub(r"[_\-\.]", " ", stem)
-    stem = re.sub(r"\d+", "", stem).lower().replace(" ", "")
-    return sum(1 for t in _name_tokens(candidate_name) if len(t) >= 4 and t in stem)
+    stem = re.sub(r"[_\-\. ]", "", stem)
+    stem = re.sub(r"\d+", "", stem).lower()
+    return sum(1 for t in _candidate_tokens(candidate_name) if len(t) >= 4 and t in stem)
 
 
 def best_resume_for_candidate(
