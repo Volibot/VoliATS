@@ -213,7 +213,7 @@ def fetch_emails_from_folder(token: str, folder_id: str, folder_path: str) -> li
         f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
         f"/mailFolders/{folder_id}/messages"
         f"?$top={EMAIL_PAGE_SIZE}"
-        f"&$select=id,subject,from,receivedDateTime,hasAttachments"
+        f"&$select=id,subject,from,receivedDateTime,hasAttachments,body"
         f"&$filter=hasAttachments eq true"
     )
 
@@ -447,6 +447,82 @@ def _extract_address(addr_obj: dict) -> str:
         return ""
 
 
+# ── Contact index (body-based matching) ───────────────────────────────────────
+
+def _normalize_phone(raw: str) -> str:
+    """Normalize any Indian phone string to a bare 10-digit number, or ''."""
+    digits = re.sub(r"\D", "", str(raw))
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    return digits if len(digits) == 10 else ""
+
+
+def build_contact_index(profiles: list[dict]) -> tuple[dict, dict]:
+    """
+    Returns (email_index, phone_index) — each maps a candidate's contact
+    detail to their profile row for O(1) lookup from email body text.
+    """
+    email_index: dict[str, dict] = {}
+    phone_index: dict[str, dict] = {}
+    for p in profiles:
+        cand_email = (p.get("email_id") or "").strip().lower()
+        if cand_email:
+            email_index[cand_email] = p
+        phone = _normalize_phone(p.get("contact_number") or "")
+        if phone:
+            phone_index[phone] = p
+    log.info(f"Contact index: {len(email_index)} email(s), {len(phone_index)} phone(s).")
+    return email_index, phone_index
+
+
+def _profiles_from_body(
+    body: dict,
+    email_index: dict,
+    phone_index: dict,
+    already_matched: set[int],
+) -> list[dict]:
+    """
+    Parse the email body and return every profile whose email address or
+    phone number appears in the body text.  These are the candidates the
+    recruiter listed in this specific email, so we can be confident any
+    resume attachment in the same email belongs to one of them.
+    """
+    content = body.get("content", "")
+    if not content:
+        return []
+
+    # Strip HTML tags if needed
+    if body.get("contentType", "text").lower() == "html":
+        try:
+            from bs4 import BeautifulSoup
+            text = BeautifulSoup(content, "lxml").get_text(" ")
+        except Exception:
+            text = re.sub(r"<[^>]+>", " ", content)
+    else:
+        text = content
+
+    found: dict[int, dict] = {}  # keyed by profile id to deduplicate
+
+    # Match by candidate email address
+    for addr in re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text):
+        p = email_index.get(addr.lower())
+        if p and p["id"] not in already_matched:
+            found[p["id"]] = p
+
+    # Match by candidate phone (collapse whitespace/dashes first)
+    compact = re.sub(r"[\s\-\.]", "", text)
+    for raw in re.findall(r"(?:\+91|91|0)?[6-9]\d{9}", compact):
+        phone = _normalize_phone(raw)
+        if phone:
+            p = phone_index.get(phone)
+            if p and p["id"] not in already_matched:
+                found[p["id"]] = p
+
+    return list(found.values())
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def run() -> None:
@@ -491,6 +567,7 @@ def run() -> None:
         return
 
     profile_index = build_profile_index(profiles)
+    email_index, phone_index = build_contact_index(profiles)
 
     # ── Enumerate all mail folders ────────────────────────────────────────────
     all_folders = list_all_folders(mail_token)
@@ -529,18 +606,28 @@ def run() -> None:
             if not from_addr:
                 continue
 
-            candidate_profiles = [
+            subject    = msg.get("subject", "").strip()
+            message_id = msg["id"]
+
+            # Primary: find candidates whose email/phone appears in the body
+            body_profiles = _profiles_from_body(
+                msg.get("body", {}), email_index, phone_index, matched_profile_ids
+            )
+
+            # Fallback: recruiter-based match for profiles not already found via body
+            body_ids = {p["id"] for p in body_profiles}
+            recruiter_profiles = [
                 p for p in profile_index.get(from_addr, [])
-                if p["id"] not in matched_profile_ids
+                if p["id"] not in matched_profile_ids and p["id"] not in body_ids
             ]
+
+            candidate_profiles = body_profiles + recruiter_profiles
             if not candidate_profiles:
                 continue
 
-            subject    = msg.get("subject", "").strip()
-            message_id = msg["id"]
             log.info(
-                f"  Email from {from_addr!r} | {subject!r} "
-                f"| {len(candidate_profiles)} profile(s)"
+                f"  Email from {from_addr!r} | {subject!r} | "
+                f"{len(body_profiles)} body-matched + {len(recruiter_profiles)} filename-fallback"
             )
 
             attachments = list_attachments(mail_token, message_id)
