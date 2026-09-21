@@ -6,3 +6,5 @@ openpyxl
 python-dotenv
 beautifulsoup4>=4.12
 lxml  # optional but faster parser
+pypdf>=3.0.0
+python-docx>=1.0.0

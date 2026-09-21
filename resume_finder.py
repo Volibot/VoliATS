@@ -427,6 +427,73 @@ def best_resume_for_candidate(
     return None
 
 
+# ── Resume content verification ───────────────────────────────────────────────
+
+def _extract_text(filename: str, content: bytes) -> str:
+    """
+    Extract plain text from a PDF, DOCX, or DOC file.
+    Returns '' if extraction fails (caller treats that as unverifiable, not a mismatch).
+    """
+    ext = os.path.splitext(filename)[1].lower()
+    try:
+        if ext == ".pdf":
+            import io
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            return " ".join(page.extract_text() or "" for page in reader.pages)
+        elif ext == ".docx":
+            import io
+            from docx import Document
+            return " ".join(p.text for p in Document(io.BytesIO(content)).paragraphs)
+        elif ext == ".doc":
+            # No pip-only DOC parser; scan raw bytes for ASCII/latin-1 text —
+            # good enough to spot an email address or phone number.
+            return content.decode("latin-1", errors="ignore")
+    except Exception as exc:
+        log.debug(f"Text extraction failed for {filename!r}: {exc}")
+    return ""
+
+
+def _content_matches(text: str, profile: dict) -> bool:
+    """
+    Return True if the resume text contains the candidate's email address,
+    normalised phone number, or at least 2 name tokens (≥3 chars each).
+    If text is empty (extraction failed) returns True so the file is still
+    accepted — we only reject when we CAN read the content and it clearly
+    does not belong to this candidate.
+    """
+    if not text:
+        return True  # unverifiable → accept
+
+    text_lower = text.lower()
+    digits_only = re.sub(r"\D", "", text)
+
+    # 1. Candidate email
+    cand_email = (profile.get("email_id") or "").strip().lower()
+    if cand_email and cand_email in text_lower:
+        log.debug(f"    content-check: email matched ({cand_email})")
+        return True
+
+    # 2. Normalised phone (10 digits, no country code)
+    phone = _normalize_phone(str(profile.get("contact_number") or ""))
+    if phone and phone in digits_only:
+        log.debug(f"    content-check: phone matched ({phone})")
+        return True
+
+    # 3. Candidate name — require ≥ 2 tokens of ≥ 3 chars present in text
+    name = (profile.get("name_of_candidate") or "").strip()
+    if name:
+        tokens = {t for t in _candidate_tokens(name) if len(t) >= 3}
+        if tokens:
+            hits = sum(1 for t in tokens if t in text_lower)
+            threshold = min(2, len(tokens))
+            if hits >= threshold:
+                log.debug(f"    content-check: name matched ({hits}/{len(tokens)} tokens)")
+                return True
+
+    return False
+
+
 # ── Profile index ──────────────────────────────────────────────────────────────
 
 def build_profile_index(profiles: list[dict]) -> dict[str, list[dict]]:
@@ -655,6 +722,17 @@ def run() -> None:
                 content = fetch_attachment_bytes(mail_token, message_id, att_id) if att_id else None
                 if content is None:
                     log.error(f"  Could not download {att_name!r} — skipping")
+                    stats["errors"] += 1
+                    continue
+
+                # Content verification: name/email/phone must appear inside the file
+                resume_text = _extract_text(att_name, content)
+                if not _content_matches(resume_text, profile):
+                    log.warning(
+                        f"  Content check FAILED: {candidate_name!r} → {att_name!r} "
+                        f"(name/email/phone not found in document — skipping)"
+                    )
+                    claimed.discard(att_name)  # release so another candidate can claim it
                     stats["errors"] += 1
                     continue
 
