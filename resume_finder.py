@@ -215,7 +215,6 @@ def fetch_emails_from_folder(token: str, folder_id: str, folder_path: str) -> li
         f"?$top={EMAIL_PAGE_SIZE}"
         f"&$select=id,subject,from,receivedDateTime,hasAttachments"
         f"&$filter=hasAttachments eq true"
-        f"&$orderby=receivedDateTime desc"
     )
 
     emails: list[dict] = []
