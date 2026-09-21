@@ -1,0 +1,71 @@
+name: Find & Link Resumes (hrvolibit)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — preview matches without uploading or updating Supabase"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      only_missing:
+        description: "Only process profiles with no attachment"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      limit:
+        description: "Max profiles to process (0 = unlimited)"
+        required: false
+        default: "0"
+
+jobs:
+  find-resumes:
+    name: Find & Link Resumes
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      OD_TENANT_ID:        ${{ secrets.OD_TENANT_ID }}
+      OD_CLIENT_ID:        ${{ secrets.OD_CLIENT_ID }}
+      OD_CLIENT_SECRET:    ${{ secrets.OD_CLIENT_SECRET }}
+      OD_REFRESH_TOKEN:    ${{ secrets.OD_REFRESH_TOKEN }}
+      ONEDRIVE_USER:       ${{ secrets.ONEDRIVE_USER }}
+      TARGET_MAILBOX:      ${{ secrets.TARGET_MAILBOX }}
+      ONEDRIVE_FOLDER:     ${{ secrets.ONEDRIVE_FOLDER }}
+      SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
+      DRY_RUN:             ${{ inputs.dry_run }}
+      ONLY_MISSING:        ${{ inputs.only_missing }}
+      LIMIT:               ${{ inputs.limit }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run resume finder
+        run: python resume_finder.py
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resume-finder-log-${{ github.run_id }}
+          path: resume_finder.log
+          retention-days: 14
