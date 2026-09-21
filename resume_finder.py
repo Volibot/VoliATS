@@ -432,22 +432,34 @@ def best_resume_for_candidate(
 def _extract_text(filename: str, content: bytes) -> str:
     """
     Extract plain text from a PDF, DOCX, or DOC file.
-    Returns '' if extraction fails (caller treats that as unverifiable, not a mismatch).
+    Tries pdfminer.six first for PDFs (better font/encoding support), then
+    falls back to pypdf.  Returns '' if all extraction fails so the caller
+    treats the file as unverifiable rather than a mismatch.
     """
+    import io
     ext = os.path.splitext(filename)[1].lower()
     try:
         if ext == ".pdf":
-            import io
-            from pypdf import PdfReader
-            reader = PdfReader(io.BytesIO(content))
-            return " ".join(page.extract_text() or "" for page in reader.pages)
+            # pdfminer.six handles more font encodings than pypdf
+            try:
+                from pdfminer.high_level import extract_text as _pdfminer
+                text = _pdfminer(io.BytesIO(content))
+                if text and text.strip():
+                    return text
+            except Exception:
+                pass
+            # pypdf fallback
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(content))
+                return " ".join(page.extract_text() or "" for page in reader.pages)
+            except Exception:
+                pass
         elif ext == ".docx":
-            import io
             from docx import Document
             return " ".join(p.text for p in Document(io.BytesIO(content)).paragraphs)
         elif ext == ".doc":
-            # No pip-only DOC parser; scan raw bytes for ASCII/latin-1 text —
-            # good enough to spot an email address or phone number.
+            # No pip-only DOC parser; decode raw bytes — enough to find email/phone.
             return content.decode("latin-1", errors="ignore")
     except Exception as exc:
         log.debug(f"Text extraction failed for {filename!r}: {exc}")
@@ -457,13 +469,20 @@ def _extract_text(filename: str, content: bytes) -> str:
 def _content_matches(text: str, profile: dict) -> bool:
     """
     Return True if the resume text contains the candidate's email address,
-    normalised phone number, or at least 2 name tokens (≥3 chars each).
-    If text is empty (extraction failed) returns True so the file is still
-    accepted — we only reject when we CAN read the content and it clearly
-    does not belong to this candidate.
+    normalised phone, or ≥ 2 name tokens (≥ 3 chars each).
+
+    Returns True (accept) when:
+    - text is empty           → extraction failed, unverifiable
+    - text has < 30 words     → likely garbled/encrypted PDF, unverifiable
+    We only REJECT when we successfully extracted readable text and none of
+    the candidate's identifiers appear in it.
     """
     if not text:
-        return True  # unverifiable → accept
+        return True  # extraction failed → unverifiable → accept
+
+    words = text.split()
+    if len(words) < 30:
+        return True  # too little text → likely garbled → accept
 
     text_lower = text.lower()
     digits_only = re.sub(r"\D", "", text)
@@ -474,7 +493,7 @@ def _content_matches(text: str, profile: dict) -> bool:
         log.debug(f"    content-check: email matched ({cand_email})")
         return True
 
-    # 2. Normalised phone (10 digits, no country code)
+    # 2. Normalised 10-digit phone (no country code)
     phone = _normalize_phone(str(profile.get("contact_number") or ""))
     if phone and phone in digits_only:
         log.debug(f"    content-check: phone matched ({phone})")
@@ -486,8 +505,7 @@ def _content_matches(text: str, profile: dict) -> bool:
         tokens = {t for t in _candidate_tokens(name) if len(t) >= 3}
         if tokens:
             hits = sum(1 for t in tokens if t in text_lower)
-            threshold = min(2, len(tokens))
-            if hits >= threshold:
+            if hits >= min(2, len(tokens)):
                 log.debug(f"    content-check: name matched ({hits}/{len(tokens)} tokens)")
                 return True
 
@@ -725,16 +743,20 @@ def run() -> None:
                     stats["errors"] += 1
                     continue
 
-                # Content verification: name/email/phone must appear inside the file
-                resume_text = _extract_text(att_name, content)
-                if not _content_matches(resume_text, profile):
-                    log.warning(
-                        f"  Content check FAILED: {candidate_name!r} → {att_name!r} "
-                        f"(name/email/phone not found in document — skipping)"
-                    )
-                    claimed.discard(att_name)  # release so another candidate can claim it
-                    stats["errors"] += 1
-                    continue
+                # Content verification: only applied to filename-fallback profiles.
+                # Body-matched profiles are already verified via email/phone in the
+                # email body, so a second content check inside the file is redundant
+                # and risks false rejection from PDFs with poor text extraction.
+                if profile["id"] not in body_ids:
+                    resume_text = _extract_text(att_name, content)
+                    if not _content_matches(resume_text, profile):
+                        log.warning(
+                            f"  Content check FAILED: {candidate_name!r} → {att_name!r} "
+                            f"(name/email/phone not found in document — skipping)"
+                        )
+                        claimed.discard(att_name)  # release so another candidate can claim it
+                        stats["errors"] += 1
+                        continue
 
                 od_url = upload_to_onedrive(od_token, att_name, content)
                 if not od_url:
