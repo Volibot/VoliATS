@@ -40,8 +40,8 @@ jobs:
       ONEDRIVE_USER:       ${{ secrets.ONEDRIVE_USER }}
       TARGET_MAILBOX:      ${{ secrets.TARGET_MAILBOX }}
       ONEDRIVE_FOLDER:     ${{ secrets.ONEDRIVE_FOLDER }}
-      SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
-      SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
+      DB_DSN:              ${{ secrets.DB_DSN }}
+      DB_TABLE_NAME:       ${{ secrets.DB_TABLE_NAME }}
       DRY_RUN:             ${{ inputs.dry_run }}
       ONLY_MISSING:        ${{ inputs.only_missing }}
       LIMIT:               ${{ inputs.limit }}
