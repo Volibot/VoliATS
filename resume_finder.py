@@ -380,22 +380,6 @@ def _file_tokens(filename: str) -> set[str]:
     return {t.lower() for t in stem.split() if len(t) >= 4} - _FILE_STOPWORDS
 
 
-def _token_match_score(candidate_name: str, filename: str) -> int:
-    if not candidate_name or not filename:
-        return 0
-    return len(_candidate_tokens(candidate_name) & _file_tokens(filename))
-
-
-def _substr_match_score(candidate_name: str, filename: str) -> int:
-    """Fallback: check if any name token (>= 4 chars) is a substring of the filename stem."""
-    stem = os.path.splitext(filename)[0]
-    stem = re.sub(r"\[.*?\]", " ", stem)
-    stem = re.sub(r"([a-z])([A-Z])", r"\1 \2", stem)
-    stem = re.sub(r"[_\-\. ]", "", stem)
-    stem = re.sub(r"\d+", "", stem).lower()
-    return sum(1 for t in _candidate_tokens(candidate_name) if len(t) >= 4 and t in stem)
-
-
 def best_resume_for_candidate(
     candidate_name: Optional[str],
     resume_files: list[dict],
@@ -403,24 +387,41 @@ def best_resume_for_candidate(
 ) -> Optional[dict]:
     """
     Return the best-matching unclaimed attachment for the candidate, or None.
-    Matching uses token overlap between candidate name tokens and filename tokens.
-    CamelCase filenames (e.g. SivaSaiSrinivasGurrala[5y_0m].pdf) are split
-    before tokenising, so token matching covers all realistic filename formats.
+
+    Score is a tuple (overlap_count, last_name_hit):
+      - overlap_count: number of shared tokens between candidate name and filename
+      - last_name_hit: 1 if the candidate's last name is among the matched tokens, else 0
+
+    Tiebreaking by last_name_hit ensures that when two files both score 1,
+    the one matching the last name (e.g. "Ughade") beats the one matching
+    only the first name (e.g. "Rahul" in RahulSingh_RESUME.docx).
     """
     name = candidate_name or ""
-    best_att, best_score = None, 0
+    c_tokens = _candidate_tokens(name)
+    name_words = name.strip().split()
+    last_name = name_words[-1].lower() if name_words else ""
+
+    best_att, best_score = None, (0, 0)
 
     for att in resume_files:
         fname = att["name"]
         if fname in claimed:
             continue
-        score = _token_match_score(name, fname)
+        matched = c_tokens & _file_tokens(fname)
+        overlap = len(matched)
+        if overlap == 0:
+            continue
+        last_name_hit = 1 if last_name and len(last_name) >= 2 and last_name in matched else 0
+        score = (overlap, last_name_hit)
         if score > best_score:
             best_score, best_att = score, att
 
-    if best_att and best_score >= 1:
+    if best_att and best_score[0] >= 1:
         claimed.add(best_att["name"])
-        log.info(f"  Matched {name!r} → {best_att['name']!r} (score={best_score})")
+        log.info(
+            f"  Matched {name!r} → {best_att['name']!r} "
+            f"(score={best_score[0]}, last_name={'yes' if best_score[1] else 'no'})"
+        )
         return best_att
 
     return None
@@ -563,7 +564,6 @@ def run() -> None:
 
                 att_id   = matched_att.get("id")
                 att_name = matched_att["name"]
-                log.info(f"  Matched {candidate_name!r} → {att_name!r}")
 
                 content = fetch_attachment_bytes(mail_token, message_id, att_id) if att_id else None
                 if content is None:
