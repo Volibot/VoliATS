@@ -452,35 +452,57 @@ def best_resume_for_candidate(
 def _extract_text(filename: str, content: bytes) -> str:
     """
     Extract plain text from a PDF, DOCX, or DOC file.
-    Tries pdfminer.six first for PDFs (better font/encoding support), then
-    falls back to pypdf.  Returns '' if all extraction fails so the caller
-    treats the file as unverifiable rather than a mismatch.
+
+    PDF extraction has three layers:
+      1. pdfminer.six  — best for text-layer PDFs with complex fonts/encodings
+      2. pypdf          — fast fallback for straightforward text-layer PDFs
+      3. OCR (pdf2image + pytesseract) — last resort for scanned/image-only PDFs
+
+    Layers 1 and 2 are skipped to OCR when they return fewer than 30 words
+    (a sign the PDF has no usable text layer).
     """
     import io
     ext = os.path.splitext(filename)[1].lower()
     try:
         if ext == ".pdf":
-            # pdfminer.six handles more font encodings than pypdf
+            # Layer 1: pdfminer.six
             try:
                 from pdfminer.high_level import extract_text as _pdfminer
                 text = _pdfminer(io.BytesIO(content))
-                if text and text.strip():
+                if text and len(text.split()) >= 30:
                     return text
             except Exception:
                 pass
-            # pypdf fallback
+
+            # Layer 2: pypdf
             try:
                 from pypdf import PdfReader
-                reader = PdfReader(io.BytesIO(content))
-                return " ".join(page.extract_text() or "" for page in reader.pages)
+                text = " ".join(
+                    page.extract_text() or "" for page in PdfReader(io.BytesIO(content)).pages
+                )
+                if text and len(text.split()) >= 30:
+                    return text
             except Exception:
                 pass
+
+            # Layer 3: OCR — for scanned / image-only PDFs
+            try:
+                from pdf2image import convert_from_bytes
+                import pytesseract
+                log.debug(f"Falling back to OCR for {filename!r}")
+                pages = convert_from_bytes(content, dpi=200, last_page=5)
+                return " ".join(pytesseract.image_to_string(p) for p in pages)
+            except Exception as exc:
+                log.debug(f"OCR failed for {filename!r}: {exc}")
+
         elif ext == ".docx":
             from docx import Document
             return " ".join(p.text for p in Document(io.BytesIO(content)).paragraphs)
+
         elif ext == ".doc":
             # No pip-only DOC parser; decode raw bytes — enough to find email/phone.
             return content.decode("latin-1", errors="ignore")
+
     except Exception as exc:
         log.debug(f"Text extraction failed for {filename!r}: {exc}")
     return ""

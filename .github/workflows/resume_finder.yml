@@ -56,6 +56,9 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Install system dependencies (OCR)
+        run: sudo apt-get install -y poppler-utils tesseract-ocr
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
