@@ -28,6 +28,7 @@ Optional:
 
 import os
 import re
+import time
 import logging
 from typing import Optional
 
@@ -77,7 +78,18 @@ RESUME_EXTENSIONS = {".pdf", ".doc", ".docx"}
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
-def get_mail_token() -> str:
+_mail_token_cache: dict = {"token": "", "acquired_at": 0.0}
+
+
+def get_mail_token(force: bool = False) -> str:
+    """
+    Return a valid app-only mail token, refreshing automatically when the
+    cached token is older than 50 minutes (tokens expire after 60 minutes).
+    Pass force=True to skip the age check and always fetch a new token.
+    """
+    age = time.time() - _mail_token_cache["acquired_at"]
+    if not force and _mail_token_cache["token"] and age < 3000:
+        return _mail_token_cache["token"]
     result = ConfidentialClientApplication(
         AZURE_CLIENT_ID,
         authority=f"https://login.microsoftonline.com/{AZURE_TENANT_ID}",
@@ -85,7 +97,11 @@ def get_mail_token() -> str:
     ).acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
     if "access_token" not in result:
         raise RuntimeError(f"Mail token failed: {result.get('error_description')}")
-    return result["access_token"]
+    _mail_token_cache["token"] = result["access_token"]
+    _mail_token_cache["acquired_at"] = time.time()
+    if force:
+        log.info("Mail token refreshed (forced on 401).")
+    return _mail_token_cache["token"]
 
 
 def get_onedrive_token() -> str:
@@ -271,6 +287,9 @@ def list_attachments(token: str, message_id: str) -> list[dict]:
     )
     try:
         resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        if resp.status_code == 401:
+            token = get_mail_token(force=True)
+            resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
         resp.raise_for_status()
         return resp.json().get("value", [])
     except Exception as exc:
@@ -285,6 +304,9 @@ def fetch_attachment_bytes(token: str, message_id: str, att_id: str) -> Optional
     )
     try:
         resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=120)
+        if resp.status_code == 401:
+            token = get_mail_token(force=True)
+            resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=120)
         resp.raise_for_status()
         return resp.content
     except Exception as exc:
@@ -723,6 +745,8 @@ def run() -> None:
             log.debug(f"Skipping empty folder: {folder_path!r}")
             continue
 
+        # Proactively refresh token if > 50 min old (expires at 60 min)
+        mail_token = get_mail_token()
         log.info(f"Scanning folder: {folder_path!r} ({total_items} item(s))")
         emails = fetch_emails_from_folder(mail_token, folder_id, folder_path)
         stats["folders_scanned"] += 1
@@ -778,34 +802,54 @@ def run() -> None:
                     continue
 
                 candidate_name = profile.get("name_of_candidate") or ""
-                matched_att = best_resume_for_candidate(candidate_name, resume_atts, claimed)
+                is_body_matched = profile["id"] in body_ids
+
+                # Try attachments in filename-score order until one passes content
+                # check. Body-matched candidates get up to 5 tries (we know their
+                # resume is definitely in this email); fallback candidates get 2.
+                max_tries = 5 if is_body_matched else 2
+                tried: set[str] = set()
+                matched_att = content = None
+
+                while len(tried) < max_tries:
+                    # Pass claimed|tried so best_resume_for_candidate skips both
+                    # globally claimed files and files already tried for this candidate.
+                    # Using a union (new set) means the internal claimed.add() inside
+                    # the function does NOT modify our real 'claimed' set.
+                    att = best_resume_for_candidate(
+                        candidate_name, resume_atts, claimed | tried
+                    )
+                    if att is None:
+                        break
+
+                    att_id_try   = att.get("id")
+                    att_name_try = att["name"]
+                    tried.add(att_name_try)
+
+                    raw = fetch_attachment_bytes(mail_token, message_id, att_id_try) if att_id_try else None
+                    if raw is None:
+                        log.error(f"  Could not download {att_name_try!r}")
+                        stats["errors"] += 1
+                        continue
+
+                    resume_text = _extract_text(att_name_try, raw)
+                    if _content_matches(resume_text, profile):
+                        matched_att = att
+                        content = raw
+                        claimed.add(att_name_try)  # permanently claim
+                        break
+                    else:
+                        log.info(
+                            f"  Content check failed: {candidate_name!r} → {att_name_try!r}"
+                            f" (trying next, attempt {len(tried)}/{max_tries})"
+                        )
 
                 if matched_att is None:
-                    log.debug(f"  No resume match for {candidate_name!r}")
+                    log.debug(f"  No verified resume for {candidate_name!r}")
                     continue
 
                 att_id   = matched_att.get("id")
                 att_name = matched_att["name"]
-
-                content = fetch_attachment_bytes(mail_token, message_id, att_id) if att_id else None
-                if content is None:
-                    log.error(f"  Could not download {att_name!r} — skipping")
-                    stats["errors"] += 1
-                    continue
-
-                # Content verification: runs for all profiles.
-                # Garbled/scanned PDFs (< 30 words extracted) are accepted as
-                # unverifiable. Only rejects when readable text is present and
-                # none of the candidate's identifiers appear in it.
-                resume_text = _extract_text(att_name, content)
-                if not _content_matches(resume_text, profile):
-                    log.warning(
-                        f"  Content check FAILED: {candidate_name!r} → {att_name!r} "
-                        f"(name/email/phone not found in document — skipping)"
-                    )
-                    claimed.discard(att_name)  # release so another candidate can claim it
-                    stats["errors"] += 1
-                    continue
 
                 od_url = upload_to_onedrive(od_token, att_name, content)
                 if not od_url:
