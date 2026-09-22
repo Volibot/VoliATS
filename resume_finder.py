@@ -771,20 +771,19 @@ def run() -> None:
                     stats["errors"] += 1
                     continue
 
-                # Content verification: only applied to filename-fallback profiles.
-                # Body-matched profiles are already verified via email/phone in the
-                # email body, so a second content check inside the file is redundant
-                # and risks false rejection from PDFs with poor text extraction.
-                if profile["id"] not in body_ids:
-                    resume_text = _extract_text(att_name, content)
-                    if not _content_matches(resume_text, profile):
-                        log.warning(
-                            f"  Content check FAILED: {candidate_name!r} → {att_name!r} "
-                            f"(name/email/phone not found in document — skipping)"
-                        )
-                        claimed.discard(att_name)  # release so another candidate can claim it
-                        stats["errors"] += 1
-                        continue
+                # Content verification: runs for all profiles.
+                # Garbled/scanned PDFs (< 30 words extracted) are accepted as
+                # unverifiable. Only rejects when readable text is present and
+                # none of the candidate's identifiers appear in it.
+                resume_text = _extract_text(att_name, content)
+                if not _content_matches(resume_text, profile):
+                    log.warning(
+                        f"  Content check FAILED: {candidate_name!r} → {att_name!r} "
+                        f"(name/email/phone not found in document — skipping)"
+                    )
+                    claimed.discard(att_name)  # release so another candidate can claim it
+                    stats["errors"] += 1
+                    continue
 
                 od_url = upload_to_onedrive(od_token, att_name, content)
                 if not od_url:
