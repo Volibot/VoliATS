@@ -180,7 +180,7 @@ def list_all_folders(token: str) -> list[dict]:
     folders: list[dict] = []
 
     def _recurse(parent_id: Optional[str], path_prefix: str, depth: int) -> None:
-        if depth > 3:
+        if depth > 5:
             return
         if parent_id:
             url = (
