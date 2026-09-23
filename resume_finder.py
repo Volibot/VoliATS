@@ -512,7 +512,7 @@ def _extract_text(filename: str, content: bytes) -> str:
                 from pdf2image import convert_from_bytes
                 import pytesseract
                 log.debug(f"Falling back to OCR for {filename!r}")
-                pages = convert_from_bytes(content, dpi=200, last_page=5)
+                pages = convert_from_bytes(content, dpi=150, last_page=2)
                 return " ".join(pytesseract.image_to_string(p) for p in pages)
             except Exception as exc:
                 log.debug(f"OCR failed for {filename!r}: {exc}")
@@ -760,20 +760,38 @@ def run() -> None:
             subject    = msg.get("subject", "").strip()
             message_id = msg["id"]
 
-            # Body: Graph API list responses often return body empty even when
-            # requested via $select.  Fetch individually for recruiter emails.
-            body = msg.get("body") or {}
+            # Fast pre-check: skip emails with no recruiter profiles and no
+            # inline body content (avoids an attachment list call entirely).
+            recruiter_pre = [
+                p for p in profile_index.get(from_addr, [])
+                if p["id"] not in matched_profile_ids
+            ]
+            inline_body = msg.get("body") or {}
+            inline_body_profiles = _profiles_from_body(
+                inline_body, email_index, phone_index, matched_profile_ids
+            )
+            if not recruiter_pre and not inline_body_profiles:
+                continue
+
+            # List attachments before fetching the body — skip the body fetch
+            # entirely when the email has no resume attachments (saves an API
+            # call for every non-resume email from known recruiters).
+            attachments = list_attachments(mail_token, message_id)
+            resume_atts = [a for a in attachments if _is_resume(a.get("name", ""))]
+            if not resume_atts:
+                continue
+
+            # Now fetch body (Graph API usually omits it from list responses).
+            body = inline_body
             if not body.get("content") and from_addr in profile_index:
                 body = fetch_message_body(mail_token, message_id)
-                if body.get("content"):
-                    log.debug(f"  Body fetched separately for message {message_id}")
 
-            # Primary: find candidates whose email/phone appears in the body
+            # Primary: candidates whose email/phone appears in the body
             body_profiles = _profiles_from_body(
                 body, email_index, phone_index, matched_profile_ids
             )
 
-            # Fallback: recruiter-based match for profiles not already found via body
+            # Fallback: recruiter-based match for profiles not found via body
             body_ids = {p["id"] for p in body_profiles}
             recruiter_profiles = [
                 p for p in profile_index.get(from_addr, [])
@@ -788,11 +806,6 @@ def run() -> None:
                 f"  Email from {from_addr!r} | {subject!r} | "
                 f"{len(body_profiles)} body-matched + {len(recruiter_profiles)} filename-fallback"
             )
-
-            attachments = list_attachments(mail_token, message_id)
-            resume_atts = [a for a in attachments if _is_resume(a.get("name", ""))]
-            if not resume_atts:
-                continue
 
             stats["resumes_found"] += len(resume_atts)
             claimed: set[str] = set()
