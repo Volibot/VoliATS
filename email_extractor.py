@@ -73,7 +73,8 @@ ONEDRIVE_FOLDER     = os.environ.get("ONEDRIVE_FOLDER", "HR Resumes")
 # Subfolder inside the target mailbox to read candidate emails from.
 # Set to empty string "" to read from the root inbox instead.
 INBOX_SUBFOLDER     = os.environ.get("INBOX_SUBFOLDER", "Company Profiles")
-Limit               = int(os.environ.get("LIMIT", "100"))
+SCAN_ALL_FOLDERS    = os.environ.get("SCAN_ALL_FOLDERS", "false").lower() == "true"
+Limit               = int(os.environ.get("LIMIT", "0"))
 VOLIBITS_DOMAIN     = "volibits.com"
 RESUME_EXTENSIONS   = {".pdf", ".doc", ".docx"}
 
@@ -295,6 +296,49 @@ def resolve_folder_id(token: str, folder_name: str) -> Optional[str]:
     return None
 
 
+def list_all_mail_folders(token: str) -> list[dict]:
+    """Enumerate every mail folder recursively (up to 5 levels deep)."""
+    headers = {"Authorization": f"Bearer {token}"}
+    folders: list[dict] = []
+
+    def _recurse(parent_id, path_prefix, depth):
+        if depth > 5:
+            return
+        if parent_id:
+            url = (
+                f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
+                f"/mailFolders/{parent_id}/childFolders"
+                f"?$select=id,displayName,totalItemCount&$top=50"
+            )
+        else:
+            url = (
+                f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}"
+                f"/mailFolders?$select=id,displayName,totalItemCount&$top=50"
+            )
+        while url:
+            try:
+                resp = requests.get(url, headers=headers, timeout=30)
+                resp.raise_for_status()
+            except Exception as exc:
+                log.warning(f"Folder list error at depth={depth}: {exc}")
+                break
+            data = resp.json()
+            for folder in data.get("value", []):
+                fpath = f"{path_prefix}/{folder['displayName']}" if path_prefix else folder["displayName"]
+                folders.append({
+                    "id":          folder["id"],
+                    "displayName": folder["displayName"],
+                    "path":        fpath,
+                    "totalItems":  folder.get("totalItemCount", 0),
+                })
+                _recurse(folder["id"], fpath, depth + 1)
+            url = data.get("@odata.nextLink")
+
+    _recurse(None, "", 0)
+    log.info(f"Found {len(folders)} mail folder(s) total.")
+    return folders
+
+
 # ─── Fetch emails ──────────────────────────────────────────────────────────────
 def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> list[dict]:
     """
@@ -320,18 +364,23 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
         base = f"https://graph.microsoft.com/v1.0/users/{TARGET_MAILBOX}/messages"
 
     now_utc = datetime.utcnow()
-    _today_iso    = now_utc.strftime("%Y-%m-%dT23:59:59Z")
-    _end_date_iso = (now_utc - timedelta(hours=LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    _date_filter = (
-        f"receivedDateTime ge {_end_date_iso}"
-        f" and receivedDateTime le {_today_iso}"
-    )
+    if LOOKBACK_HOURS > 0:
+        _today_iso    = now_utc.strftime("%Y-%m-%dT23:59:59Z")
+        _end_date_iso = (now_utc - timedelta(hours=LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _date_filter  = (
+            f"receivedDateTime ge {_end_date_iso}"
+            f" and receivedDateTime le {_today_iso}"
+        )
+        filter_param = f"&$filter={requests.utils.quote(_date_filter)}"
+    else:
+        filter_param = ""  # no date restriction — fetch entire history
+
     url = (
         f"{base}"
         f"?$top=50"
         f"&$select=id,subject,from,toRecipients,ccRecipients,"
         f"body,receivedDateTime,isRead,hasAttachments"
-        f"&$filter={requests.utils.quote(_date_filter)}"
+        f"{filter_param}"
         f"&$orderby=receivedDateTime desc"
     )
 
@@ -361,14 +410,14 @@ def fetch_emails(token: str, top: int = 50, folder_id: Optional[str] = None) -> 
         all_emails.extend(batch)
         log.info(f"  Page {page}: {len(batch)} email(s) (total so far: {len(all_emails)})")
 
-        if len(all_emails) >= top:
+        if top > 0 and len(all_emails) >= top:
             log.info(f"Reached LIMIT={top} — stopping pagination.")
             break
 
         url = data.get("@odata.nextLink")
 
     log.info(f"Fetched {len(all_emails)} email(s) total across {page} page(s).")
-    return all_emails[:top]
+    return all_emails if top <= 0 else all_emails[:top]
 
 
 def mark_email_read(token: str, message_id: str) -> None:
@@ -1318,7 +1367,8 @@ def process_emails() -> None:
     log.info(f"OneDrive user  : {ONEDRIVE_USER}")
     log.info(f"OneDrive folder: {ONEDRIVE_FOLDER}")
     log.info(f"Inbox subfolder: {INBOX_SUBFOLDER or '(root inbox)'}")
-    log.info(f"Lookback       : {LOOKBACK_HOURS} hours")
+    log.info(f"Scan all folders: {SCAN_ALL_FOLDERS}")
+    log.info(f"Lookback       : {LOOKBACK_HOURS} hours (0 = all history)")
 
     token    = get_mail_token()
     od_token = get_onedrive_token()
@@ -1340,7 +1390,14 @@ def process_emails() -> None:
             f"Response: {_drive_check.text[:200]}"
         )
 
-    inbox_folder_id = resolve_folder_id(token, INBOX_SUBFOLDER) if INBOX_SUBFOLDER else None
+    # Build the list of folders to scan
+    if SCAN_ALL_FOLDERS:
+        all_folders = list_all_mail_folders(token)
+        log.info(f"SCAN_ALL_FOLDERS mode: {len(all_folders)} folder(s) discovered.")
+        folder_list = [{"id": None, "path": "(root inbox)"}] + all_folders
+    else:
+        inbox_folder_id = resolve_folder_id(token, INBOX_SUBFOLDER) if INBOX_SUBFOLDER else None
+        folder_list = [{"id": inbox_folder_id, "path": INBOX_SUBFOLDER or "(root inbox)"}]
 
     conn = psycopg2.connect(DB_DSN)
     conn.autocommit = False
@@ -1349,7 +1406,18 @@ def process_emails() -> None:
     ensure_tables(cur)
     conn.commit()
 
-    emails = fetch_emails(token, top=Limit, folder_id=inbox_folder_id)
+    max_per_folder = Limit if Limit > 0 else 10_000_000
+    seen_msg_ids: set[str] = set()
+    emails: list[dict] = []
+    for finfo in folder_list:
+        fid   = finfo["id"]
+        fpath = finfo.get("path", "?")
+        log.info(f"Fetching from folder: {fpath}")
+        for msg in fetch_emails(token, top=max_per_folder, folder_id=fid):
+            if msg["id"] not in seen_msg_ids:
+                seen_msg_ids.add(msg["id"])
+                emails.append(msg)
+    log.info(f"Total unique emails to process: {len(emails)}")
 
     processed = skipped = inserted = updated = conflicts = errors = 0
 

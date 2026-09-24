@@ -1,0 +1,92 @@
+name: Full Inbox Scan (Extract + Find Resumes)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run for resume finder — preview only, no uploads or DB updates"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      lookback_hours:
+        description: "Email extractor lookback (hours). 0 = scan ALL history from the beginning"
+        required: false
+        default: "0"
+      resume_only_missing:
+        description: "Resume finder: only process profiles with no attachment"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  full-scan:
+    name: Extract Profiles + Find Resumes (Full Inbox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      AZURE_TENANT_ID:      ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID:      ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET:  ${{ secrets.AZURE_CLIENT_SECRET }}
+      OD_TENANT_ID:         ${{ secrets.OD_TENANT_ID }}
+      OD_CLIENT_ID:         ${{ secrets.OD_CLIENT_ID }}
+      OD_CLIENT_SECRET:     ${{ secrets.OD_CLIENT_SECRET }}
+      OD_REFRESH_TOKEN:     ${{ secrets.OD_REFRESH_TOKEN }}
+      ONEDRIVE_USER:        ${{ secrets.ONEDRIVE_USER }}
+      TARGET_MAILBOX:       ${{ secrets.TARGET_MAILBOX }}
+      ONEDRIVE_FOLDER:      ${{ secrets.ONEDRIVE_FOLDER }}
+      DB_DSN:               ${{ secrets.DB_DSN }}
+      DB_TABLE_NAME:        ${{ secrets.DB_TABLE_NAME }}
+      NOTIFY_CC_EMAILS:     ${{ secrets.NOTIFY_CC_EMAILS }}
+      # Email extractor settings
+      SCAN_ALL_FOLDERS:     "true"
+      LOOKBACK_HOURS:       ${{ inputs.lookback_hours }}
+      LIMIT:                "0"
+      INBOX_SUBFOLDER:      ""
+      ENABLE_NOTIFICATIONS: "false"
+      # Resume finder settings
+      DRY_RUN:              ${{ inputs.dry_run }}
+      ONLY_MISSING:         ${{ inputs.resume_only_missing }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system dependencies (OCR)
+        run: sudo apt-get install -y poppler-utils tesseract-ocr
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Step 1 — Extract candidate profiles from all inbox folders
+        run: python email_extractor.py
+
+      - name: Upload extractor log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extractor-log-${{ github.run_id }}
+          path: extractor.log
+          retention-days: 14
+
+      - name: Step 2 — Find & link resumes for all profiles
+        run: python resume_finder.py
+
+      - name: Upload resume finder log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resume-finder-log-${{ github.run_id }}
+          path: resume_finder.log
+          retention-days: 14
