@@ -41,10 +41,9 @@ jobs:
       TARGET_MAILBOX:       ${{ secrets.TARGET_MAILBOX }}
       ONEDRIVE_FOLDER:      ${{ secrets.ONEDRIVE_FOLDER }}
       DB_DSN:               ${{ secrets.DB_DSN }}
-      DB_TABLE_NAME:        ${{ secrets.DB_TABLE_NAME }}
       NOTIFY_CC_EMAILS:     ${{ secrets.NOTIFY_CC_EMAILS }}
-      # Full scan table (separate from the live hrvolibit table)
-      DB_TABLE_NAME:        "hrvolibit_fullscan"
+      # Writes to a separate table — never touches live hrvolibit data
+      DB_TABLE_NAME:        hrvolibit_fullscan
       # Email extractor settings
       SCAN_ALL_FOLDERS:     "true"
       SKIP_PROCESSED_CHECK: "true"
