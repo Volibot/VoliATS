@@ -73,8 +73,9 @@ ONEDRIVE_FOLDER     = os.environ.get("ONEDRIVE_FOLDER", "HR Resumes")
 # Subfolder inside the target mailbox to read candidate emails from.
 # Set to empty string "" to read from the root inbox instead.
 INBOX_SUBFOLDER     = os.environ.get("INBOX_SUBFOLDER", "Company Profiles")
-SCAN_ALL_FOLDERS    = os.environ.get("SCAN_ALL_FOLDERS", "false").lower() == "true"
-Limit               = int(os.environ.get("LIMIT", "0"))
+SCAN_ALL_FOLDERS       = os.environ.get("SCAN_ALL_FOLDERS", "false").lower() == "true"
+SKIP_PROCESSED_CHECK   = os.environ.get("SKIP_PROCESSED_CHECK", "false").lower() == "true"
+Limit                  = int(os.environ.get("LIMIT", "0"))
 VOLIBITS_DOMAIN     = "volibits.com"
 RESUME_EXTENSIONS   = {".pdf", ".doc", ".docx"}
 
@@ -936,6 +937,42 @@ def upload_all_attachments(od_token: str, mail_token: str, msg: dict) -> dict[st
 
 # ─── DB schema helpers ──────────────────────────────────────────────────────────
 def ensure_tables(cur) -> None:
+    cur.execute(
+        pgsql.SQL("""
+            CREATE TABLE IF NOT EXISTS {table} (
+                id                  BIGSERIAL PRIMARY KEY,
+                recruiter           TEXT,
+                date                DATE,
+                jr_no               TEXT,
+                client_recruiter    TEXT,
+                general_skill       TEXT,
+                name_of_candidate   TEXT,
+                contact_number      TEXT,
+                email_id            TEXT,
+                total_experience    TEXT,
+                relevant_experience TEXT,
+                current_ctc         TEXT,
+                expected_ctc        TEXT,
+                notice_period       TEXT,
+                current_org         TEXT,
+                current_location    TEXT,
+                preferred_location  TEXT,
+                email_from          TEXT,
+                email_to            TEXT,
+                delivery_type       TEXT,
+                company_name        TEXT,
+                attachment          TEXT,
+                is_duplicate        TEXT,
+                created_by          TEXT,
+                created_date        TIMESTAMP,
+                modified_by         TEXT,
+                modified_date       TIMESTAMP,
+                record_status       TEXT,
+                final_status        TEXT,
+                remarks             TEXT
+            )
+        """).format(table=pgsql.Identifier(DB_TABLE))
+    )
     cur.execute("""
         CREATE TABLE IF NOT EXISTS hr_processed_emails (
             message_id    TEXT PRIMARY KEY,
@@ -1425,7 +1462,7 @@ def process_emails() -> None:
         subject    = msg.get("subject", "").strip()
         message_id = msg["id"]
 
-        if is_email_processed(cur, message_id):
+        if not SKIP_PROCESSED_CHECK and is_email_processed(cur, message_id):
             log.info(f"Already processed — skipping {message_id} | {subject!r}")
             mark_email_read(token, message_id)
             continue
