@@ -111,7 +111,9 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "jr no(mention the jr number where profiles are uploaded on sf).",
         "jr no (mention the jr number where profiles are uploaded on sf).",
         "jrno(mention the jr number where profiles are uploaded on sf).",
-        "vendor name", "vendor", "vendor no", "vendor_name",
+        "r no", "r_no", "r no.", "r", "rno", "r_number", "r number",
+        "rno.", "r#", "RNo.", "RNo", "RNO", "R", "r no:",
+        "vendor no", "vendor_no", "source",
     ],
     "name_of_candidate": [
         "candidate name", "candidate_name", "name", "applicant name",
@@ -439,17 +441,17 @@ IGNORE_RE  = re.compile(r"^(fw|fwd|re|aw)\s*:", re.IGNORECASE)
 DUPLICATE_SUBJECT_RE = re.compile(r"\bduplicate\b", re.IGNORECASE)
 
 _JR_PATTERNS = [
-    re.compile(r"[-|]\s*(?:jr\.?\s*(?:no\.?\s*)?)(?P<jr>\d{4,})\s*$",   re.IGNORECASE),
-    re.compile(r"^\s*(?:jr\.?\s*(?:no\.?\s*)?)(?P<jr>\d{4,})\s*[-|]",   re.IGNORECASE),
-    re.compile(r"[-|]\s*(?P<jr>\d{4,})\s*$",                              re.IGNORECASE),
-    re.compile(r"^\s*(?P<jr>\d{4,})\s*[-|]",                              re.IGNORECASE),
-    re.compile(r"\(\s*jr\.?\s*(?:no\.?\s*)?(?P<jr>\d{4,})\s*\)",          re.IGNORECASE),
-    re.compile(r"\(\s*(?P<jr>\d{4,})\s*\)",                                re.IGNORECASE),
-    re.compile(r"\bjr\.?\s*(?:no\.?\s*)?(?P<jr>\d{4,})\b",                re.IGNORECASE),
-    re.compile(r"\b(?P<jr>\d{4,})\b",                                      re.IGNORECASE),
+    re.compile(r"[-|]\s*(?:(?:jr|r)\.?\s*(?:no\.?\s*)?)(?P<jr>\d{5,})\s*$",   re.IGNORECASE),
+    re.compile(r"^\s*(?:(?:jr|r)\.?\s*(?:no\.?\s*)?)(?P<jr>\d{5,})\s*[-|]",   re.IGNORECASE),
+    re.compile(r"[-|]\s*(?P<jr>\d{5,})\s*$",                                   re.IGNORECASE),
+    re.compile(r"^\s*(?P<jr>\d{5,})\s*[-|]",                                   re.IGNORECASE),
+    re.compile(r"\(\s*(?:jr|r)\.?\s*(?:no\.?\s*)?(?P<jr>\d{5,})\s*\)",        re.IGNORECASE),
+    re.compile(r"\(\s*(?P<jr>\d{5,})\s*\)",                                    re.IGNORECASE),
+    re.compile(r"\b(?:jr|r)\.?\s*(?:no\.?\s*)?(?P<jr>\d{5,})\b",              re.IGNORECASE),
+    re.compile(r"\b(?P<jr>\d{5,})\b",                                          re.IGNORECASE),
 ]
 
-_JR_STUB_RE = re.compile(r"\bjr\.?\s*(?:no\.?)?\s*$", re.IGNORECASE)
+_JR_STUB_RE = re.compile(r"\b(?:jr|r)\.?\s*(?:no\.?)?\s*$", re.IGNORECASE)
 
 _SKILL_FILLER_RE = re.compile(
     r"\b(?:profiles?\s+for\s+(?:the\s+)?"
@@ -467,16 +469,16 @@ _SKILL_FILLER_RE = re.compile(
 
 _STRIP_TAGS_RE = re.compile(r"<[^>]+>")
 
-# Matches "JR", "JR No", "JR#", "JR Number", "JR_No", "JR-No.", "JR : 38674" etc.
-# Any non-digit chars (up to 15) allowed between "jr" and the number,
-# then 4-6 digit number. Case-insensitive.
+# Matches "JR", "JR No", "JR#", "R No", "R#", etc.
+# Any non-digit chars (up to 15) allowed between "jr"/"r" and the number,
+# then 5-8 digit number. Case-insensitive.
 _BODY_JR_RE = re.compile(
-    r"\bjr[^0-9\n]{0,15}?(?P<jr>\d{4,6})\b",
+    r"\b(?:jr|r)[^0-9\n]{0,15}?(?P<jr>\d{5,8})\b",
     re.IGNORECASE,
 )
 
-# Recognise a table header cell as a JR No column
-_JR_HEADER_RE = re.compile(r"\bjr\b", re.IGNORECASE)
+# Recognise a table header cell as a JR/R No column
+_JR_HEADER_RE = re.compile(r"\b(?:jr|r)\b", re.IGNORECASE)
 
 
 def _scan_body_for_jr_no(body_html: str) -> Optional[str]:
@@ -503,7 +505,7 @@ def _scan_body_for_jr_no(body_html: str) -> Optional[str]:
                     if col_idx < len(dcells):
                         val = _clean_cell(dcells[col_idx].get_text(separator=" ").strip())
                         val = _sanitize_jr_no(val)
-                        if val and re.fullmatch(r"\d{3,8}", val):
+                        if val and re.fullmatch(r"\d{5,8}", val):
                             log.info(f"  JR no found in table scan: {val!r} (header={htext!r})")
                             return val
 
@@ -581,7 +583,7 @@ def _clean_cell(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-_JR_EMBEDDED_RE = re.compile(r"[A-Za-z][A-Za-z0-9\s]*[/\\-](\d{3,8})\s*$")
+_JR_EMBEDDED_RE = re.compile(r"[A-Za-z][A-Za-z0-9\s]*[/\\-](\d{5,8})\s*$")
 
 def _sanitize_jr_no(val: str) -> str:
     """Extract bare JR number from values like 'Volibits/38674' or 'VB-38674'."""
@@ -647,6 +649,10 @@ def parse_html_table(html: str) -> list[dict]:
             }
             if "jr_no" in record:
                 record["jr_no"] = _sanitize_jr_no(record["jr_no"])
+                # Validate jr_no is 5-8 digits only; discard if not numeric
+                if record["jr_no"] and not re.fullmatch(r"\d{5,8}", record["jr_no"]):
+                    log.debug(f"  ↷ Discarding invalid jr_no value: {record['jr_no']!r} (not 5-8 digits)")
+                    record["jr_no"] = ""
             if record:
                 rows.append(record)
 
